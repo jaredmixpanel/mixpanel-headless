@@ -18,7 +18,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-05-22T06:36:59.531145Z"
+exclude-newer = "2026-06-03T07:20:10.025257Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1301,23 +1301,26 @@ source = { editable = "." }
 dependencies = [
     { name = "anytree" },
     { name = "httpx" },
-    { name = "jq" },
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyarrow", marker = "python_full_version >= '3.11'" },
     { name = "pydantic" },
-    { name = "rich" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "tomli-w" },
-    { name = "typer" },
 ]
 
 [package.optional-dependencies]
+cli = [
+    { name = "jq" },
+    { name = "rich" },
+    { name = "typer" },
+]
 dev = [
     { name = "hypothesis", extra = ["cli"] },
     { name = "interrogate" },
+    { name = "jq" },
     { name = "mutmut" },
     { name = "mypy" },
     { name = "pandas-stubs", version = "2.3.3.260113", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1325,7 +1328,9 @@ dev = [
     { name = "psutil" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "rich" },
     { name = "ruff" },
+    { name = "typer" },
     { name = "types-psutil" },
 ]
 docs = [
@@ -1335,6 +1340,9 @@ docs = [
     { name = "mkdocs-material" },
     { name = "mkdocs-typer" },
     { name = "mkdocstrings", extra = ["python"] },
+]
+jq = [
+    { name = "jq" },
 ]
 notebook = [
     { name = "ipykernel" },
@@ -1356,7 +1364,9 @@ requires-dist = [
     { name = "hypothesis", extras = ["cli"], marker = "extra == 'dev'", specifier = ">=6.151.13" },
     { name = "interrogate", marker = "extra == 'dev'", specifier = ">=1.7" },
     { name = "ipykernel", marker = "extra == 'notebook'", specifier = ">=6.0" },
-    { name = "jq", specifier = ">=1.9.0" },
+    { name = "jq", marker = "extra == 'cli'", specifier = ">=1.9.0" },
+    { name = "jq", marker = "extra == 'dev'", specifier = ">=1.9.0" },
+    { name = "jq", marker = "extra == 'jq'", specifier = ">=1.9.0" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.5" },
     { name = "mkdocs-llmstxt", marker = "extra == 'docs'", specifier = ">=0.2.0" },
     { name = "mkdocs-llmstxt-md", marker = "extra == 'docs'", specifier = ">=0.1.0" },
@@ -1373,14 +1383,16 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
-    { name = "rich", specifier = ">=13.0" },
+    { name = "rich", marker = "extra == 'cli'", specifier = ">=13.0" },
+    { name = "rich", marker = "extra == 'dev'", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "tomli-w", specifier = ">=1.0" },
-    { name = "typer", specifier = ">=0.12" },
+    { name = "typer", marker = "extra == 'cli'", specifier = ">=0.12" },
+    { name = "typer", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "types-psutil", marker = "extra == 'dev'", specifier = ">=7.2.0.20251228" },
 ]
-provides-extras = ["dev", "docs", "notebook"]
+provides-extras = ["cli", "dev", "docs", "jq", "notebook"]
 
 [package.metadata.requires-dev]
 dev = [

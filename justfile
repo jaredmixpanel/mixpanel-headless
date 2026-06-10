@@ -146,9 +146,34 @@ clean:
     rm -rf .coverage htmlcov
     find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# Build package
+# Build package (sdist + standard wheel)
 build: clean
     uv build
+
+# Build ONLY the standard (full) wheel into dist/ — includes the CLI.
+build-wheel:
+    uv build --wheel
+
+# Build the slim (library-only) wheel into dist/slim/ — excludes the CLI
+# surface (cli/, __main__.py) and its deps (typer/rich/jq) so it
+# micropip-installs cleanly under Pyodide. Same source tree, packaging-time
+# exclude only (see hatch_build.py). Output:
+#   dist/slim/mixpanel_headless-<version>-py3-none-any.whl
+build-wheel-slim:
+    MXD_BUILD_SLIM=1 uv build --wheel -o dist/slim
+
+# Node + Pyodide harness: build the slim wheel, then prove in the real
+# Emscripten runtime that it micropip-installs (deps resolvable), imports,
+# self-registers PyfetchTransport, falls back to the sequential executor, and
+# runs the chmod / MP_OAUTH_CLIENT_DIR paths on MEMFS without raising.
+# Needs network: bundled wheels from the Pyodide CDN + anytree from PyPI.
+test-pyodide-node: build-wheel-slim
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd tests/pyodide
+    npm install --silent --no-audit --no-fund
+    node provision.mjs
+    node run.mjs
 
 # === Documentation ===
 
