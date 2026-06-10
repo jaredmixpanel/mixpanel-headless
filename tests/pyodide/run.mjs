@@ -8,7 +8,8 @@
 //       request via a stubbed synchronous XHR;
 //   (d) the ThreadPoolExecutor sites fall back to a sequential loop (Pyodide
 //       has no OS threads — the threaded path would raise);
-//   (e) the chmod / MP_OAUTH_CLIENT_DIR paths run on MEMFS without raising.
+//   (e) the chmod / MP_OAUTH_CLIENT_DIR paths run on MEMFS without raising;
+//   (f) the in-Pyodide API introspection (mp.help) round-trips under Emscripten.
 //
 // Run `node provision.mjs` first (the just recipe does) to stage the bundled
 // wheels into node_modules/pyodide.
@@ -133,6 +134,15 @@ MeCache(account_name="personal", storage_dir=pathlib.Path("/tmp/mp_me")).put(
 )
 result["e_memfs_chmod_and_client_dir"] = "ensure_account_dir + save_client_info + MeCache.put OK"
 
+# (f) in-Pyodide API introspection: mp.help() works on the slim wheel under
+# Emscripten (pure-stdlib inspect, no fcntl/threads) and a dotted lookup
+# round-trips with the expected content.
+overview = mp.help()
+assert isinstance(overview, str) and "Workspace" in overview, "mp.help() overview must mention Workspace"
+method_doc = mp.help("Workspace.query")
+assert "query" in method_doc, "mp.help('Workspace.query') must contain 'query'"
+result["f_help_introspection"] = "mp.help() + mp.help('Workspace.query') round-trip OK"
+
 json.dumps(result)
 `;
 
@@ -160,6 +170,7 @@ async function main() {
     'c_pyfetch_transport',
     'd_sequential_fallback',
     'e_memfs_chmod_and_client_dir',
+    'f_help_introspection',
   ];
   for (const key of expected) {
     if (!(key in checks)) throw new Error(`missing check: ${key}`);

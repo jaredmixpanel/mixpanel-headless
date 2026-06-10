@@ -81,6 +81,7 @@ from mixpanel_headless.exceptions import (
     ValidationError,
     WorkspaceScopeError,
 )
+from mixpanel_headless.help import help
 from mixpanel_headless.replay_labels import (
     default_label_fn,
     selector_label_fn,
@@ -296,6 +297,8 @@ __version__ = "0.2.0"
 __all__ = [
     # Core
     "Workspace",
+    # In-package API introspection (run_python-friendly docs)
+    "help",
     # Auth redesign (042) types
     "Account",
     "AccountType",
