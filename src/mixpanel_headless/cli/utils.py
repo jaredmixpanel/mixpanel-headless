@@ -19,7 +19,6 @@ from contextlib import contextmanager
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-import jq  # type: ignore[import-not-found]
 import pydantic
 import typer
 from rich.console import Console
@@ -511,6 +510,20 @@ def _apply_jq_filter(json_str: str, filter_expr: str) -> list[Any]:
         err_console.print(f"[red]Invalid JSON input:[/red] {e.msg}")
         # Suppress chain: typer.Exit is a CLI exit signal, not a debugging exception.
         # Users want clean error messages, not stack traces.
+        raise typer.Exit(ExitCode.INVALID_ARGS) from None
+
+    try:
+        # jq is an optional, CLI-only binary extra — excluded from the base
+        # install so the slim wheel micropip-installs cleanly under Pyodide.
+        # Imported lazily so the CLI still loads without it; only --jq fails.
+        import jq  # type: ignore[import-not-found]
+    except ImportError:
+        hint = rich_escape("pip install 'mixpanel_headless[jq]'")
+        err_console.print(
+            "[red]jq filtering is unavailable.[/red] The --jq option requires "
+            f"the optional 'jq' dependency. Install it with: {hint}"
+        )
+        # Suppress chain: typer.Exit is a CLI exit signal, not a debugging exception.
         raise typer.Exit(ExitCode.INVALID_ARGS) from None
 
     try:
