@@ -16,10 +16,16 @@ Core analytics—typed Insights engine queries (DAU/WAU/MAU, formulas, filters, 
 ## Installation
 
 ```bash
+# Library only (Python API):
 pip install mixpanel-headless
+
+# With the `mp` CLI (adds Typer + Rich, and jq for `--jq` filtering):
+pip install 'mixpanel-headless[cli]'
 ```
 
-Requires Python 3.10+. Verify installation:
+Requires Python 3.10+. The bare install keeps the dependency set small (and
+installable under Pyodide/WebAssembly); the `[cli]` extra adds the CLI-only
+dependencies. Verify the CLI:
 
 ```bash
 mp --version

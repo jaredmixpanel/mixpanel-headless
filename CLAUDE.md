@@ -8,7 +8,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 | Context | Name | Example |
 |---------|------|---------|
-| PyPI package | `mixpanel_headless` | `pip install mixpanel_headless` |
+| PyPI package | `mixpanel_headless` | `pip install 'mixpanel_headless[cli]'` (bare `pip install mixpanel_headless` for library-only) |
 | Python import | `mixpanel_headless` | `import mixpanel_headless as mp` |
 | CLI command | `mp` | `mp query segmentation -e Login --from 2025-01-01` |
 
@@ -282,9 +282,9 @@ Suppressing stderr causes silent failures and makes it impossible to diagnose is
 ## Technology Stack
 
 - Python 3.10+ with full type hints (mypy --strict compliant)
-- Typer (CLI) + Rich (output formatting)
-- jq (JSON filtering via `--jq` option for CLI commands)
-- httpx (HTTP client), Pydantic (validation)
+- Base library deps: httpx (HTTP client), Pydantic (validation), pandas, pyarrow, networkx, anytree — all pure-Python or Pyodide-bundled, so the base/slim wheel installs under Emscripten
+- `[cli]` extra (CLI only): Typer (commands) + Rich (output formatting) + jq
+- `[jq]` extra: jq (JSON filtering via the `--jq` CLI option) — a binary extension, omitted from the base install so it never blocks a Pyodide/micropip install
 - Hypothesis (property-based testing), mutmut (mutation testing)
 - uv (package manager), just (command runner)
 
