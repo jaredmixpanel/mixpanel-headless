@@ -43,11 +43,67 @@ from mixpanel_headless._internal.io_utils import (
     read_credential_text,
     reject_if_symlink,
 )
+from mixpanel_headless._internal.runtime import is_emscripten
 
 logger = logging.getLogger(__name__)
 
 
 _ACCOUNT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _chmod_tolerant(path: Path, mode: int) -> None:
+    """Apply ``chmod`` to ``path``, tolerating MEMFS rejection under Emscripten.
+
+    Native behavior is unchanged — a chmod failure propagates so a real
+    permission problem on a credential directory is never silently ignored.
+    Under Emscripten the filesystem is Pyodide's in-memory MEMFS, which is
+    per-worker and ephemeral and does not enforce POSIX mode bits; a chmod
+    there can raise ``OSError`` for an operation that is meaningless anyway,
+    so it is logged at debug and swallowed rather than aborting the write.
+
+    Args:
+        path: File or directory to chmod.
+        mode: Target POSIX mode bits (e.g. ``stat.S_IRWXU``).
+
+    Raises:
+        OSError: On native platforms, if the chmod fails.
+
+    Example:
+        ```python
+        _chmod_tolerant(account_dir, stat.S_IRWXU)  # 0o700, MEMFS-safe
+        ```
+    """
+    try:
+        path.chmod(mode)
+    except OSError:
+        if not is_emscripten():
+            raise
+        logger.debug(
+            "chmod(%s, %o) failed under Emscripten MEMFS; tolerating.", path, mode
+        )
+
+
+def _client_dir_override() -> Path | None:
+    """Return the ``MP_OAUTH_CLIENT_DIR`` override directory, or ``None``.
+
+    Mirrors :func:`_storage_root`'s env-then-default resolution but scoped to
+    the Dynamic Client Registration (DCR) client-info file, so an embedding
+    host (e.g. the Pyodide desktop app) can point client registration at its
+    own sandboxed path without relocating the rest of the OAuth state. When
+    unset, callers fall back to the storage directory (unchanged behavior).
+
+    Returns:
+        ``Path($MP_OAUTH_CLIENT_DIR)`` when the env var is set and non-empty,
+        else ``None``.
+
+    Example:
+        ```python
+        # MP_OAUTH_CLIENT_DIR=/sandbox/oauth → Path("/sandbox/oauth")
+        override = _client_dir_override()
+        ```
+    """
+    env_dir = os.environ.get("MP_OAUTH_CLIENT_DIR")
+    return Path(env_dir) if env_dir else None
 
 
 def _storage_root() -> Path:
@@ -136,7 +192,7 @@ def ensure_account_dir(name: str) -> Path:
     finally:
         os.umask(old_umask)
     # Defensive chmod so a pre-existing dir with looser permissions gets locked down.
-    path.chmod(stat.S_IRWXU)
+    _chmod_tolerant(path, stat.S_IRWXU)
     return path
 
 
@@ -274,17 +330,26 @@ class OAuthStorage:
                 f"Invalid region: {region!r}. Must be a 2-letter lowercase string."
             )
 
-    def _ensure_dir(self) -> None:
-        """Create storage directory with restricted permissions if it doesn't exist.
+    def _ensure_dir(self, directory: Path | None = None) -> None:
+        """Create a credential directory with restricted permissions.
 
-        Sets directory permissions to ``0o700`` (owner-only access).
+        Sets directory permissions to ``0o700`` (owner-only access). Accepts
+        an explicit ``directory`` so a write to the ``MP_OAUTH_CLIENT_DIR``
+        override (which differs from the storage dir) creates *that* dir
+        securely; defaults to the storage dir, preserving prior behavior for
+        token writes.
+
+        Args:
+            directory: Directory to create/lock down. Defaults to the storage
+                directory when ``None``.
         """
+        target = directory if directory is not None else self._storage_dir
         old_umask = os.umask(0o077)
         try:
-            self._storage_dir.mkdir(parents=True, exist_ok=True)
+            target.mkdir(parents=True, exist_ok=True)
         finally:
             os.umask(old_umask)
-        self._storage_dir.chmod(stat.S_IRWXU)
+        _chmod_tolerant(target, stat.S_IRWXU)
 
     def _check_and_fix_permissions(self, path: Path) -> None:
         """Check and repair file/directory permissions.
@@ -374,7 +439,7 @@ class OAuthStorage:
             path: File path to write to.
             data: Dictionary to serialize as JSON.
         """
-        self._ensure_dir()
+        self._ensure_dir(path.parent)
         atomic_write_bytes(
             path, json.dumps(data, indent=2, default=str).encode("utf-8")
         )
@@ -440,13 +505,18 @@ class OAuthStorage:
     def _client_path(self, region: str) -> Path:
         """Return the file path for client info of a given region.
 
+        Honors the ``MP_OAUTH_CLIENT_DIR`` override (see
+        :func:`_client_dir_override`) so an embedding host can relocate the DCR
+        client-info file; falls back to the storage directory when unset.
+
         Args:
             region: Mixpanel data residency region.
 
         Returns:
             Path to the client info JSON file.
         """
-        return self._storage_dir / f"client_{region}.json"
+        base = _client_dir_override() or self._storage_dir
+        return base / f"client_{region}.json"
 
     def save_tokens(self, tokens: OAuthTokens, region: str) -> None:
         """Persist OAuth tokens to disk.

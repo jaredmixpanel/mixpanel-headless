@@ -27,6 +27,7 @@ from mixpanel_headless._internal.io_utils import (
     read_credential_text,
     reject_if_symlink,
 )
+from mixpanel_headless._internal.runtime import is_emscripten
 from mixpanel_headless.exceptions import AuthenticationError, ConfigError, QueryError
 
 if TYPE_CHECKING:
@@ -565,11 +566,20 @@ class MeCache:
         except OSError as e:
             # Cache contains user emails / org names / project names — PII
             # that should not be world-readable. A filesystem that can't
-            # enforce 0o700 is a real config issue, not a soft warning.
-            raise ConfigError(
-                f"Cannot enforce 0o700 on cache directory {self._cache_dir}: {e}",
-                details={"path": str(self._cache_dir)},
-            ) from e
+            # enforce 0o700 is a real config issue, not a soft warning — so on
+            # native platforms this still raises. Under Emscripten the cache
+            # lives on Pyodide's per-worker, ephemeral MEMFS, where mode bits
+            # are unenforceable and the chmod can fail for a no-op; tolerate it
+            # there so the cache write still lands.
+            if not is_emscripten():
+                raise ConfigError(
+                    f"Cannot enforce 0o700 on cache directory {self._cache_dir}: {e}",
+                    details={"path": str(self._cache_dir)},
+                ) from e
+            logger.debug(
+                "chmod 0o700 on %s failed under Emscripten MEMFS; tolerating.",
+                self._cache_dir,
+            )
 
         # Add cache metadata, stripping bulky fields that bloat the cache.
         # Workspace member_list and unified_member_list can be 10-30MB each

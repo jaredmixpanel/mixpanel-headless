@@ -40,6 +40,7 @@ import sys
 import threading
 from pathlib import Path
 
+from mixpanel_headless._internal.runtime import is_emscripten
 from mixpanel_headless.exceptions import ConfigError
 
 __all__ = [
@@ -478,7 +479,10 @@ def read_credential_bytes(path: Path) -> bytes:
         # Clear O_NONBLOCK on the fd. POSIX ignores it on regular
         # files, but clearing keeps the fd's flag set tidy and avoids
         # surprises if a future refactor reads from a non-regular fd.
-        if hasattr(os, "O_NONBLOCK"):
+        # Skipped under Emscripten: Pyodide defines ``os.O_NONBLOCK`` but
+        # removes the ``fcntl`` module, and clearing the flag is a no-op on
+        # the regular files this reads, so skipping it there is safe.
+        if hasattr(os, "O_NONBLOCK") and not is_emscripten():
             import fcntl
 
             current = fcntl.fcntl(fd, fcntl.F_GETFL)

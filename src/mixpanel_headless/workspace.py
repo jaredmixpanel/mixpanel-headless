@@ -93,6 +93,7 @@ from mixpanel_headless._internal.query.user_validators import (
     validate_user_args,
     validate_user_params,
 )
+from mixpanel_headless._internal.runtime import is_emscripten
 from mixpanel_headless._internal.segfilter import build_segfilter_entry
 from mixpanel_headless._internal.services.discovery import DiscoveryService
 from mixpanel_headless._internal.services.live_query import LiveQueryService
@@ -9818,7 +9819,7 @@ class Workspace:
                     "session_id": session_id,
                     "pages_fetched": 1,
                     "failed_pages": [],
-                    "parallel": True,
+                    "parallel": not is_emscripten(),
                     "workers": capped_workers,
                 },
             )
@@ -9844,14 +9845,15 @@ class Workspace:
             )
             return page_num, [transform_profile(p) for p in result.profiles]
 
-        with ThreadPoolExecutor(max_workers=capped_workers) as executor:
-            futures = {
-                executor.submit(_fetch_page, p): p for p in range(1, pages_needed)
-            }
-            for future in as_completed(futures):
-                page_num = futures[future]
+        if is_emscripten():
+            # Pyodide has no OS threads; fetch the remaining pages sequentially
+            # with identical semantics (fatal errors abort; other failures are
+            # recorded in failed_pages). Results are assembled by page order
+            # below, so the profile output is byte-identical to the threaded
+            # path.
+            for page_num in range(1, pages_needed):
                 try:
-                    pnum, profiles = future.result()
+                    pnum, profiles = _fetch_page(page_num)
                     page_results[pnum] = profiles
                 except (
                     AuthenticationError,
@@ -9859,8 +9861,6 @@ class Workspace:
                     ServerError,
                     QueryError,
                 ):
-                    for f in futures:
-                        f.cancel()
                     raise
                 except Exception as exc:
                     logger.warning(
@@ -9872,6 +9872,35 @@ class Workspace:
                         exc_info=True,
                     )
                     failed_pages.append(page_num)
+        else:
+            with ThreadPoolExecutor(max_workers=capped_workers) as executor:
+                futures = {
+                    executor.submit(_fetch_page, p): p for p in range(1, pages_needed)
+                }
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    try:
+                        pnum, profiles = future.result()
+                        page_results[pnum] = profiles
+                    except (
+                        AuthenticationError,
+                        RateLimitError,
+                        ServerError,
+                        QueryError,
+                    ):
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to fetch page %d (%s: %s), "
+                            "continuing with partial results",
+                            page_num,
+                            type(exc).__name__,
+                            exc,
+                            exc_info=True,
+                        )
+                        failed_pages.append(page_num)
 
         for p in sorted(page_results.keys()):
             all_profiles.extend(page_results[p])
@@ -9886,7 +9915,7 @@ class Workspace:
                 "session_id": session_id,
                 "pages_fetched": pages_needed - len(failed_pages),
                 "failed_pages": sorted(failed_pages),
-                "parallel": True,
+                "parallel": not is_emscripten(),
                 "workers": capped_workers,
             },
         )
@@ -10797,36 +10826,54 @@ class Workspace:
         # include_mixpanel_events=False here regardless of the caller's flag.
         results: dict[int, Replay] = {}
         failures: list[tuple[str, Exception]] = []
-        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            futures = {
-                pool.submit(
-                    self.fetch_replay,
-                    rid,
-                    distinct_id=distinct_map.get(rid),
-                    env=env,
-                    retention_days=retention_map.get(rid),
-                    max_files=max_files,
-                    include_mixpanel_events=False,
-                    cdn_concurrency=cdn_concurrency,
-                ): (i, rid)
-                for i, rid in enumerate(replay_ids)
-            }
-            for future in as_completed(futures):
-                idx, rid = futures[future]
+
+        def _fetch_one(rid: str) -> Replay:
+            """Fetch a single replay with events deferred to the batch join."""
+            return self.fetch_replay(
+                rid,
+                distinct_id=distinct_map.get(rid),
+                env=env,
+                retention_days=retention_map.get(rid),
+                max_files=max_files,
+                include_mixpanel_events=False,
+                cdn_concurrency=cdn_concurrency,
+            )
+
+        def _record_failure(rid: str, exc: Exception) -> None:
+            """Log and stash a per-replay failure (isolation, not abort)."""
+            # One replay's CDN stall, 404, or parse error must not sink the
+            # whole bundle (mirrors the MCP server's
+            # asyncio.gather(return_exceptions=True) + skip). Log it and keep
+            # the successful replays; only an all-fail batch raises.
+            logger.warning(
+                "fetch_replays: skipping replay %s — %s: %s",
+                rid,
+                type(exc).__name__,
+                exc,
+            )
+            failures.append((rid, exc))
+
+        if is_emscripten():
+            # Pyodide has no OS threads; fetch replays sequentially. Results are
+            # keyed by input index and assembled in order below, so the bundle
+            # is byte-identical to the threaded path (failures still skipped).
+            for i, rid in enumerate(replay_ids):
                 try:
-                    results[idx] = future.result()
+                    results[i] = _fetch_one(rid)
                 except Exception as exc:  # noqa: BLE001 — per-replay isolation
-                    # One replay's CDN stall, 404, or parse error must not sink
-                    # the whole bundle (mirrors the MCP server's
-                    # asyncio.gather(return_exceptions=True) + skip). Log it and
-                    # keep the successful replays; only an all-fail batch raises.
-                    logger.warning(
-                        "fetch_replays: skipping replay %s — %s: %s",
-                        rid,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    failures.append((rid, exc))
+                    _record_failure(rid, exc)
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+                futures = {
+                    pool.submit(_fetch_one, rid): (i, rid)
+                    for i, rid in enumerate(replay_ids)
+                }
+                for future in as_completed(futures):
+                    idx, rid = futures[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:  # noqa: BLE001 — per-replay isolation
+                        _record_failure(rid, exc)
         if not results and failures:
             # Every replay failed — surface the first underlying error rather
             # than a generic wrapper, preserving its type (ReplayNotFoundError,

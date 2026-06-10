@@ -47,6 +47,8 @@ from mixpanel_headless._internal.me import (
     WorkspaceView,
     select_workspace_id,
 )
+from mixpanel_headless._internal.pyodide_transport import PyfetchTransport
+from mixpanel_headless._internal.runtime import is_emscripten
 from mixpanel_headless.exceptions import (
     AuthenticationError,
     MixpanelHeadlessError,
@@ -287,6 +289,10 @@ class MixpanelAPIClient:
             token_resolver: For OAuth accounts; defaults to
                 :class:`OnDiskTokenResolver`.
             _transport: Internal parameter for testing with MockTransport.
+                When left ``None`` under Emscripten/Pyodide, a
+                :class:`PyfetchTransport` is auto-registered so network calls
+                work without a socket layer; on native platforms ``None`` keeps
+                httpx's default transport.
         """
         self._token_resolver: TokenResolver = token_resolver or OnDiskTokenResolver()
         self._session: Session = session
@@ -303,6 +309,13 @@ class MixpanelAPIClient:
         self._max_retries = max_retries
         self._client: httpx.Client | None = None
         self._transport = _transport
+        # Under Pyodide there is no socket layer, so a default (transport=None)
+        # client cannot reach the network. Self-register the synchronous-XHR
+        # transport so a plain ``Workspace()`` works with no caller changes.
+        # Gated on Emscripten and skipped when a transport was injected, so the
+        # native path (and test MockTransports) are byte-identical.
+        if self._transport is None and is_emscripten():
+            self._transport = PyfetchTransport()
         self._workspace_id: int | None = (
             session.workspace.id if session.workspace else None
         )
