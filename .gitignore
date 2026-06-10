@@ -36,6 +36,9 @@ venv/
 ENV/
 env/
 
+# Node (tests/pyodide harness deps + provisioned Pyodide wheels)
+node_modules/
+
 # Testing
 .pytest_cache/
 .coverage

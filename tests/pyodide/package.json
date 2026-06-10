@@ -1,0 +1,10 @@
+{
+  "name": "mixpanel-headless-pyodide-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node+Pyodide harness proving the slim wheel installs and runs under Emscripten (just test-pyodide-node).",
+  "dependencies": {
+    "pyodide": "0.29.4"
+  }
+}
