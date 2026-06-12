@@ -228,6 +228,43 @@ class TestAppRequest:
 
         assert exc_info.value.status_code == 422
 
+    def test_400_with_dict_error_body_is_legible(
+        self, oauth_credentials: Session
+    ) -> None:
+        """A 400 whose ``error`` field is a dict must produce a legible message.
+
+        Regression for the live dashboard-PATCH failure: the App API returned
+        a 400 whose ``error`` value was a structured object, the 400 handler
+        passed that dict straight into ``QueryError(message=...)``, and
+        ``str(exc)`` then crashed with ``TypeError: __str__ returned
+        non-string (type dict)``. The handler must now render the body into
+        the message (status code + compact body) while preserving the
+        structured body on ``response_body`` for programmatic recovery.
+        """
+        error_body = {
+            "error": {"code": "invalid_section", "message": "dashboard PATCH rejected"},
+            "status": "error",
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            """Return a 400 with a structured (dict-valued) ``error`` body."""
+            return httpx.Response(400, json=error_body)
+
+        client = create_mock_client(oauth_credentials, handler)
+        with client, pytest.raises(QueryError) as exc_info:
+            client.app_request(
+                "PATCH", "/projects/12345/dashboards/99", json_body={"x": 1}
+            )
+
+        exc = exc_info.value
+        rendered = str(exc)  # must not raise TypeError
+        assert isinstance(rendered, str)
+        assert "dashboard PATCH rejected" in rendered
+        assert "400" in rendered
+        # Structured body is preserved unchanged for programmatic recovery.
+        assert exc.response_body == error_body
+        assert exc.status_code == 400
+
     def test_maps_401_to_authentication_error(self, oauth_credentials: Session) -> None:
         """app_request() should raise AuthenticationError on 401."""
 

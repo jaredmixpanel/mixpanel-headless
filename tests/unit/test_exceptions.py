@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 
@@ -66,6 +67,37 @@ class TestMixpanelHeadlessError:
         assert "MixpanelHeadlessError" in repr(exc)
         assert "Test error" in repr(exc)
         assert "TEST" in repr(exc)
+
+    def test_dict_message_is_coerced_to_legible_string(self) -> None:
+        """A non-str (dict) message must not crash ``str()`` and stays legible.
+
+        Reproduces the live dashboard-PATCH failure: a raise site passed a
+        response-body dict as ``message``, so ``str(exc)`` raised
+        ``TypeError: __str__ returned non-string (type dict)`` (surfacing as
+        ``<exception str() failed>``) and every caller that stringified the
+        error hit a secondary crash. The base class now coerces a non-str
+        message to compact JSON so the content survives and ``str()`` is safe.
+
+        The dict is cast to ``str`` to mirror the real defect: raise sites
+        feed ``response.json()`` values, which are typed ``Any``, so mypy
+        cannot catch the contract violation — only a runtime guard can.
+        """
+        body = {"error": {"code": "invalid", "detail": "dashboard PATCH rejected"}}
+        exc = MixpanelHeadlessError(cast(str, body))
+
+        rendered = str(exc)  # must not raise TypeError
+        assert isinstance(rendered, str)
+        assert "dashboard PATCH rejected" in rendered
+        assert "invalid" in rendered
+        # message property is normalized to the same coerced string.
+        assert exc.message == rendered
+
+    def test_non_str_scalar_message_is_coerced(self) -> None:
+        """A non-str, non-dict message (e.g. int) is coerced via ``str()``."""
+        exc = MixpanelHeadlessError(cast(str, 42))
+
+        assert str(exc) == "42"
+        assert exc.message == "42"
 
 
 class TestConfigError:

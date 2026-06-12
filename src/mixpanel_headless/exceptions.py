@@ -14,6 +14,7 @@ from errors by providing structured access to:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -21,6 +22,50 @@ from urllib.parse import urlencode
 
 if TYPE_CHECKING:
     from mixpanel_headless._internal.auth.account import Region
+
+
+def _coerce_message(message: object) -> str:
+    """Coerce an exception message of any runtime type to a string.
+
+    ``MixpanelHeadlessError`` and its subclasses declare ``message: str``, but
+    API raise sites build messages from ``response.json()`` values that are
+    typed ``Any`` — so a non-str (typically a response-body ``dict``) can slip
+    past static checking and reach the constructor. Without coercion,
+    ``__str__`` would return that non-str and Python raises
+    ``TypeError: __str__ returned non-string`` (surfaced as
+    ``<exception str() failed>``), masking the real error. Normalizing here
+    guarantees the stored message is always a string, so ``str(exc)`` can
+    never crash regardless of what a caller passed.
+
+    Args:
+        message: The raw message handed to an exception constructor. Normally
+            a ``str``; defensively handles ``dict``/``list`` (rendered as
+            compact, key-sorted JSON) and any other type (via ``str()``).
+
+    Returns:
+        ``message`` unchanged when already a ``str``; otherwise a string
+        rendering — compact JSON for ``dict``/``list`` (falling back to
+        ``str()`` when the value is not JSON-serializable), or ``str(message)``
+        for any other type.
+
+    Example:
+        ```python
+        _coerce_message("boom")
+        # 'boom'
+        _coerce_message({"error": "bad field"})
+        # '{"error": "bad field"}'
+        _coerce_message(42)
+        # '42'
+        ```
+    """
+    if isinstance(message, str):
+        return message
+    if isinstance(message, (dict, list)):
+        try:
+            return json.dumps(message, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(message)
+    return str(message)
 
 
 class MixpanelHeadlessError(Exception):
@@ -45,8 +90,9 @@ class MixpanelHeadlessError(Exception):
             code: Machine-readable error code for programmatic handling.
             details: Additional structured data about the error.
         """
-        super().__init__(message)
-        self._message = message
+        coerced = _coerce_message(message)
+        super().__init__(coerced)
+        self._message = coerced
         self._code = code
         self._details = details or {}
 

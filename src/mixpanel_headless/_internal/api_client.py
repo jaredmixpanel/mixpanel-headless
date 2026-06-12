@@ -215,6 +215,97 @@ def _build_activity_feed_date_range(
     return {"type": "relative_after", "window": {"unit": "day", "value": 30}}
 
 
+# Cap on how much error-body text is inlined into an exception message. The full
+# (untruncated) body always remains available on the exception's
+# ``response_body`` attribute; this keeps ``str(exc)`` readable.
+_ERROR_DETAIL_MAX_CHARS = 500
+
+
+def _stringify_error_detail(value: object) -> str:
+    """Render an arbitrary error-body value as a compact, legible string.
+
+    HTTP error bodies come from ``response.json()`` and are typed ``Any``, so a
+    value pulled from one (e.g. ``body["error"]``) may be a ``str``, ``dict``,
+    ``list``, or scalar. Passing a non-``str`` as an exception message violates
+    the ``MixpanelHeadlessError`` contract and historically crashed ``str(exc)``
+    with ``TypeError: __str__ returned non-string``. Coercing any value to a
+    string here keeps the detail safe to embed in a message.
+
+    Args:
+        value: The raw error detail. A ``str`` is returned unchanged;
+            ``dict``/``list`` are rendered as compact, key-sorted JSON (falling
+            back to ``str()`` when not JSON-serializable); any other type uses
+            ``str()``.
+
+    Returns:
+        A string rendering of ``value``.
+
+    Example:
+        ```python
+        _stringify_error_detail("bad field")
+        # 'bad field'
+        _stringify_error_detail({"code": "invalid", "field": "name"})
+        # '{"code": "invalid", "field": "name"}'
+        ```
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _extract_api_error_message(
+    response_body: str | dict[str, Any] | None,
+    *,
+    status_code: int,
+    default: str,
+) -> str:
+    """Build an actionable, guaranteed-``str`` message from an HTTP error body.
+
+    Extracts the human-facing detail from a parsed error response, preferring
+    the body's ``"error"`` field, then the whole body, then ``default`` — always
+    coercing to a string (see :func:`_stringify_error_detail`) and prefixing the
+    HTTP status so ``str(exc)`` is self-describing. This fixes the live
+    dashboard-PATCH failure, where a dict-valued ``"error"`` reached
+    ``QueryError(message=...)`` and crashed ``str(exc)``; the structured body is
+    still preserved verbatim on the exception's ``response_body`` attribute.
+
+    Args:
+        response_body: Parsed response body — a ``dict`` (JSON object), a
+            ``str`` (non-JSON text), or ``None`` when there was no body.
+        status_code: HTTP status code, prefixed into the returned message.
+        default: Fallback detail used when the body carries no usable text.
+
+    Returns:
+        A string of the form ``"[HTTP <status>] <detail>"``, with ``<detail>``
+        truncated to a sane length (the full body remains on ``response_body``).
+
+    Example:
+        ```python
+        _extract_api_error_message(
+            {"error": "bad field"}, status_code=400, default="Unknown error"
+        )
+        # '[HTTP 400] bad field'
+        _extract_api_error_message(None, status_code=404, default="Not found")
+        # '[HTTP 404] Not found'
+        ```
+    """
+    if isinstance(response_body, dict):
+        if "error" in response_body:
+            detail = _stringify_error_detail(response_body["error"])
+        else:
+            detail = _stringify_error_detail(response_body)
+    elif isinstance(response_body, str) and response_body:
+        detail = response_body
+    else:
+        detail = default
+    if len(detail) > _ERROR_DETAIL_MAX_CHARS:
+        detail = detail[:_ERROR_DETAIL_MAX_CHARS] + "…"
+    return f"[HTTP {status_code}] {detail}"
+
+
 # Map the resource-type spellings callers pass (lowercase / plural / snake-era) to the
 # App API's canonical Lexicon values. The data-definitions endpoints accept only the
 # camelCase ``resourceType`` query param with a capitalized value ("Event"/"User"); a
@@ -564,11 +655,11 @@ class MixpanelAPIClient:
                     request_params=request_params,
                     request_body=request_body,
                 )
-            error_msg = "Permission denied"
-            if isinstance(response_body, dict):
-                error_msg = response_body.get("error", "Permission denied")
-            elif isinstance(response_body, str):
-                error_msg = response_body[:200] or "Permission denied"
+            error_msg = _extract_api_error_message(
+                response_body,
+                status_code=response.status_code,
+                default="Permission denied",
+            )
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -579,11 +670,11 @@ class MixpanelAPIClient:
                 request_body=request_body,
             )
         if response.status_code == 400:
-            error_msg = "Unknown error"
-            if isinstance(response_body, dict):
-                error_msg = response_body.get("error", "Unknown error")
-            elif isinstance(response_body, str):
-                error_msg = response_body[:200]
+            error_msg = _extract_api_error_message(
+                response_body,
+                status_code=response.status_code,
+                default="Unknown error",
+            )
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -594,11 +685,11 @@ class MixpanelAPIClient:
                 request_body=request_body,
             )
         if response.status_code == 404:
-            error_msg = "Resource not found"
-            if isinstance(response_body, dict):
-                error_msg = response_body.get("error", "Resource not found")
-            elif isinstance(response_body, str):
-                error_msg = response_body[:200] or "Resource not found"
+            error_msg = _extract_api_error_message(
+                response_body,
+                status_code=response.status_code,
+                default="Resource not found",
+            )
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -612,11 +703,11 @@ class MixpanelAPIClient:
             # Any other 4xx (e.g., 412 Precondition Failed) — preserve the
             # response body and status as a QueryError instead of letting it
             # fall through to a generic HTTP error in _execute_with_retry().
-            error_msg = "Request failed"
-            if isinstance(response_body, dict):
-                error_msg = response_body.get("error", "Request failed")
-            elif isinstance(response_body, str):
-                error_msg = response_body[:200] or "Request failed"
+            error_msg = _extract_api_error_message(
+                response_body,
+                status_code=response.status_code,
+                default="Request failed",
+            )
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -1253,9 +1344,9 @@ class MixpanelAPIClient:
                         err_body = response.json()
                     except json.JSONDecodeError:
                         err_body = response.text[:500] if response.text else None
-                    error_msg = "Unprocessable entity"
-                    if isinstance(err_body, dict):
-                        error_msg = str(err_body.get("error", error_msg))
+                    error_msg = _extract_api_error_message(
+                        err_body, status_code=422, default="Unprocessable entity"
+                    )
                     raise QueryError(
                         error_msg,
                         status_code=422,
@@ -1812,14 +1903,15 @@ class MixpanelAPIClient:
                         # Need to read body for error
                         body = response.read()
                         response_body: str | dict[str, Any] | None = None
-                        error_msg = "Unknown error"
                         try:
                             response_body = json.loads(body)
-                            if isinstance(response_body, dict):
-                                error_msg = response_body.get("error", "Unknown error")
                         except json.JSONDecodeError:
                             response_body = body.decode()[:500] if body else None
-                            error_msg = body.decode()[:200] if body else "Unknown error"
+                        error_msg = _extract_api_error_message(
+                            response_body,
+                            status_code=response.status_code,
+                            default="Unknown error",
+                        )
                         raise QueryError(
                             error_msg,
                             status_code=response.status_code,
