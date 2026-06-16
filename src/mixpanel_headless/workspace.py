@@ -31,6 +31,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,8 +44,16 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from mixpanel_headless._internal.me import MeService
 
+from pydantic import SecretStr
+
 from mixpanel_headless._internal.api_client import MixpanelAPIClient
 from mixpanel_headless._internal.auth.account import Account as _AccountUnion
+from mixpanel_headless._internal.auth.account import (
+    OAuthTokenAccount as _OAuthTokenAccount,
+)
+from mixpanel_headless._internal.auth.account import (
+    ServiceAccount as _ServiceAccount,
+)
 from mixpanel_headless._internal.auth.bridge import load_bridge as _load_bridge
 from mixpanel_headless._internal.auth.resolver import (
     env_workspace_id as _env_workspace_id,
@@ -722,6 +731,130 @@ class Workspace:
         if self._api_client is not None:
             self._api_client.close()
             self._api_client = None
+
+    # =========================================================================
+    # PICKLE SUPPORT (sandbox state persistence — WS2)
+    # =========================================================================
+
+    # Lazily-built service handles. They wrap an ``httpx.Client`` (sockets) and
+    # async clients, so they are never serialized — ``__getstate__`` drops them
+    # and ``__setstate__`` rebuilds them on next use.
+    _SERVICE_HANDLES = (
+        "_api_client",
+        "_discovery",
+        "_live_query",
+        "_me_service",
+        "_replays_svc",
+    )
+
+    @staticmethod
+    def _scrub_session_for_pickle(session: _Session) -> _Session:
+        """Return a pickle-safe copy of ``session`` with credentials scrubbed.
+
+        Two transforms make the session safe to serialize into ``threads.db``:
+
+        - **Secret scrub.** ``pydantic.SecretStr`` pickles to *plaintext*, so
+          the service-account secret / inline OAuth bearer token would
+          otherwise leak into the snapshot. The credential field is blanked to
+          an empty :class:`SecretStr`; the worker re-injects the real value
+          from its environment at restore (:meth:`_rehydrate_credentials_from_env`).
+          ``oauth_browser`` accounts carry no inline secret (tokens live on
+          disk), so they need no scrub.
+        - **Header flattening.** ``Session.headers`` is wrapped in a
+          ``types.MappingProxyType`` after validation, which is not picklable;
+          it is flattened to a plain ``dict`` (``model_copy`` does not
+          re-validate, so the proxy is not re-applied).
+
+        Args:
+            session: The live session held by the workspace.
+
+        Returns:
+            A frozen-model copy with the credential blanked and headers
+            flattened — identical in every other axis (account identity,
+            project, workspace).
+        """
+        account = session.account
+        if isinstance(account, _ServiceAccount):
+            account = account.model_copy(update={"secret": SecretStr("")})
+        elif isinstance(account, _OAuthTokenAccount) and account.token is not None:
+            account = account.model_copy(update={"token": SecretStr("")})
+        return session.model_copy(
+            update={"account": account, "headers": dict(session.headers)}
+        )
+
+    def _rehydrate_credentials_from_env(self) -> None:
+        """Re-inject the scrubbed credential from the worker environment.
+
+        The pickled session has a blanked secret (see
+        :meth:`_scrub_session_for_pickle`). On the desktop worker the real
+        credential is present in the process environment — the same source the
+        live resolver consults — so this best-effort step restores it:
+
+        - ``service_account`` → ``MP_SECRET``;
+        - inline ``oauth_token`` → ``MP_OAUTH_TOKEN``.
+
+        When the relevant env var is absent (e.g. a unit-test restore) the
+        session is left with its blank credential; the workspace still rebuilds
+        structurally and authentication simply fails later, never here.
+        ``oauth_browser`` accounts are untouched — their tokens are resolved
+        from disk by the :class:`OnDiskTokenResolver` at request time.
+        """
+        account = self._session.account
+        if isinstance(account, _ServiceAccount):
+            secret = os.environ.get("MP_SECRET")
+            if secret:
+                self._session = self._session.model_copy(
+                    update={
+                        "account": account.model_copy(
+                            update={"secret": SecretStr(secret)}
+                        )
+                    }
+                )
+                self._account_name = self._session.account.name
+        elif isinstance(account, _OAuthTokenAccount) and account.token is not None:
+            token = os.environ.get("MP_OAUTH_TOKEN")
+            if token:
+                self._session = self._session.model_copy(
+                    update={
+                        "account": account.model_copy(
+                            update={"token": SecretStr(token)}
+                        )
+                    }
+                )
+                self._account_name = self._session.account.name
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Return a pickle-safe snapshot of the workspace.
+
+        Keeps the picklable scalars (``_session`` / ``_account_name`` /
+        ``_initial_workspace_id``) but drops every lazily-built service handle
+        (they wrap unpicklable sockets) and **scrubs the credential** so no
+        secret material reaches the pickle stream.
+
+        Returns:
+            A shallow copy of ``__dict__`` with the service handles set to
+            ``None`` and ``_session`` replaced by a credential-scrubbed copy.
+        """
+        state = self.__dict__.copy()
+        for handle in self._SERVICE_HANDLES:
+            state[handle] = None
+        state["_session"] = self._scrub_session_for_pickle(self._session)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a workspace from a pickled snapshot.
+
+        Reinstates the scalars, forces all service handles to ``None`` (they
+        rebuild lazily on next use, mirroring the :meth:`use` cache-clear), and
+        re-injects the scrubbed credential from the worker environment.
+
+        Args:
+            state: The dict produced by :meth:`__getstate__`.
+        """
+        self.__dict__.update(state)
+        for handle in self._SERVICE_HANDLES:
+            setattr(self, handle, None)
+        self._rehydrate_credentials_from_env()
 
     # =========================================================================
     # PRIVATE HELPERS

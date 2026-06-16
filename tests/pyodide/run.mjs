@@ -10,6 +10,8 @@
 //       has no OS threads — the threaded path would raise);
 //   (e) the chmod / MP_OAUTH_CLIENT_DIR paths run on MEMFS without raising;
 //   (f) the in-Pyodide API introspection (mp.help) round-trips under Emscripten.
+//   (g) a Workspace pickle round-trip works (scalars survive, secret scrubbed,
+//       service handles reset, rebuilt client re-registers the transport).
 //
 // Run `node provision.mjs` first (the just recipe does) to stage the bundled
 // wheels into node_modules/pyodide.
@@ -143,6 +145,30 @@ method_doc = mp.help("Workspace.query")
 assert "query" in method_doc, "mp.help('Workspace.query') must contain 'query'"
 result["f_help_introspection"] = "mp.help() + mp.help('Workspace.query') round-trip OK"
 
+# (g) Workspace pickle round-trip under Emscripten (WS2 — sandbox state
+# persistence). Scalars survive, the secret is scrubbed from the bytes, the
+# service handles reset to None, and the rebuilt client re-registers the
+# Emscripten transport.
+import pickle
+pickle_session = Session(
+    account=ServiceAccount(
+        name="t", region="us", username="u",
+        secret=SecretStr("PICKLE_SENTINEL_SECRET"), default_project="777",
+    ),
+    project=Project(id="12345"),
+)
+pickle_ws = Workspace(session=pickle_session)
+blob = pickle.dumps(pickle_ws)
+assert b"PICKLE_SENTINEL_SECRET" not in blob, "secret must not appear in pickle bytes"
+restored_ws = pickle.loads(blob)
+assert restored_ws.account.name == "t", "account identity must survive pickle"
+assert restored_ws._session.project.id == "12345", "project must survive pickle"
+assert restored_ws._api_client is None, "service handle must reset to None on restore"
+rebuilt = restored_ws._get_api_client()
+assert isinstance(rebuilt._transport, PyfetchTransport), "rebuilt client must re-register transport"
+rebuilt.close()
+result["g_workspace_pickle"] = "pickle round-trip OK; secret scrubbed; client rebuilt"
+
 json.dumps(result)
 `;
 
@@ -171,6 +197,7 @@ async function main() {
     'd_sequential_fallback',
     'e_memfs_chmod_and_client_dir',
     'f_help_introspection',
+    'g_workspace_pickle',
   ];
   for (const key of expected) {
     if (!(key in checks)) throw new Error(`missing check: ${key}`);
