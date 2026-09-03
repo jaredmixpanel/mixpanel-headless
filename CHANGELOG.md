@@ -50,7 +50,42 @@ may include API changes.
     `ShortLinkResolutionError` → 1. The CLI prints `details["hint"]` on a
     `hint:` line for all of them.
 
+- **Slim wheel build.** `just build-wheel-slim` emits a CLI-less wheel to
+  `dist/slim/` alongside the standard wheel, so the library can be
+  micropip-installed in constrained runtimes. The CLI's dependencies moved
+  out of the base install and into a `[cli]` extra (`typer`, `click`,
+  `rich`, `jq`), with `jq` — a binary extension that cannot build under
+  Emscripten — additionally split into its own `[jq]` extra for the `--jq`
+  filter. Install `mixpanel_headless[cli]` to use the `mp` command; the
+  base install is import-clean without any of them.
+
+- **`mixpanel_headless.help()`** prints a grouped, dynamically enumerated
+  catalog of the public surface, for hosts and agents that have no shell
+  and therefore no `mp --help`.
+
+- **`Workspace` is picklable.** `__getstate__` / `__setstate__` drop and
+  rebuild the live service handles and HTTP clients, and credentials are
+  scrubbed from the serialized state, so a workspace can be snapshotted and
+  restored (e.g. across a worker restart) without leaking secrets to disk.
+
+- **Emscripten / Pyodide runtime support.** `_internal/runtime.is_emscripten()`
+  gates the non-portable paths: `PyfetchTransport` self-registers on
+  `MixpanelAPIClient` so a plain `Workspace()` reaches the network with no
+  caller changes; `_execute_user_query_parallel` and `fetch_replays` fall
+  back to sequential execution where a `ThreadPoolExecutor` is unavailable;
+  and credential storage tolerates MEMFS chmod rejection and honors
+  `MP_OAUTH_CLIENT_DIR` for the Dynamic Client Registration file.
+
 ### Changed
+
+- **Short-link resolution is unavailable under Emscripten/Pyodide.**
+  `resolve_short_link` reads the target out of a *suppressed* redirect, but
+  the browser fetch/XHR stack follows 3xx transparently and hides
+  `Location`, so the request would land on the final HTML — or on a login
+  page — and be misreported. It now raises `ShortLinkResolutionError` with
+  code `SHORT_LINK_UNSUPPORTED_RUNTIME` before issuing any request, hinting
+  to paste the full report URL instead. Full URLs and slug links are
+  unaffected.
 
 - **`BookmarkValidationError` now exits the CLI with code 3, not 1.** The
   class is raised by about 15 pre-existing commands (`mp reports create`,
@@ -59,6 +94,13 @@ may include API changes.
   `error: params failed schema validation` plus one line per
   `severity="error"` item and exits with `INVALID_ARGS` (3). Scripts that
   test for exit code 1 on those commands must be updated.
+
+### Fixed
+
+- `MixpanelHeadlessError` coerces a non-string `message` at construction, so
+  an API error body whose `error` field is a dict or list can no longer make
+  `str(exc)` crash with `TypeError: __str__ returned non-string`. The
+  structured body is still preserved verbatim on `response_body`.
 
 ## 0.2.2 — 2026-09-01
 

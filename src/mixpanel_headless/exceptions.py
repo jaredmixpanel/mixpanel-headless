@@ -1750,7 +1750,9 @@ class ShortLinkResolutionError(ReportLinkError):
     Codes: ``SHORT_LINK_RESOLUTION_ERROR`` (default), ``SHORT_LINK_NO_LOCATION``
     (3xx without ``Location``), ``SHORT_LINK_UNEXPECTED_RESPONSE`` (200 body
     without the ``window.location.href`` script), ``SHORT_LINK_CHAIN`` (the
-    target is another shortlink; headless follows one redirect only).
+    target is another shortlink; headless follows one redirect only),
+    ``SHORT_LINK_UNSUPPORTED_RUNTIME`` (Emscripten/Pyodide, where the browser
+    fetch stack hides the redirect the resolver has to read).
     """
 
     _DEFAULT_CODE = "SHORT_LINK_RESOLUTION_ERROR"

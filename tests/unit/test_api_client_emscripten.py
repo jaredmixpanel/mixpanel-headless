@@ -1,10 +1,13 @@
-"""Tests for Emscripten auto-wiring of the Pyodide transport in the API client.
+"""Tests for the Emscripten branches of the API client.
 
 Under Pyodide, ``MixpanelAPIClient`` must transparently route through
 :class:`PyfetchTransport` so a plain ``Workspace()`` works with no caller
 changes. Off Emscripten the behavior is byte-identical to before (transport
-stays ``None`` ⇒ httpx default). The gate is monkeypatched rather than faking
-``sys.platform`` so the assertion targets exactly the client's branch.
+stays ``None`` ⇒ httpx default). Conversely, shortlink resolution depends on
+reading a suppressed redirect, which the browser fetch/XHR stack cannot
+expose, so it must refuse up front instead of misreporting. The gate is
+monkeypatched rather than faking ``sys.platform`` so each assertion targets
+exactly the branch under test.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import pytest
 
 from mixpanel_headless._internal.api_client import MixpanelAPIClient
 from mixpanel_headless._internal.pyodide_transport import PyfetchTransport
+from mixpanel_headless.exceptions import ShortLinkResolutionError
 from tests.conftest import make_session
 
 
@@ -81,3 +85,61 @@ class TestEmscriptenTransportAutoRegistration:
             assert isinstance(client._transport, PyfetchTransport)
         finally:
             client.close()
+
+
+class TestShortLinkUnavailableUnderEmscripten:
+    """``resolve_short_link`` refuses under Emscripten instead of guessing."""
+
+    def test_raises_without_issuing_a_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under Emscripten the shortlink call fails fast with an actionable hint.
+
+        ``resolve_short_link`` reads the target out of a *suppressed* redirect
+        (``follow_redirects=False`` + the ``Location`` header). The browser
+        fetch/XHR stack behind :class:`PyfetchTransport` follows redirects
+        transparently and hides ``Location``, so the request would land on the
+        final HTML — or a login page — and be misreported as
+        ``SHORT_LINK_UNEXPECTED_RESPONSE`` or a silent auth miss. The gate must
+        therefore fire before any HTTP is attempted.
+
+        Args:
+            monkeypatch: pytest fixture used to force the Emscripten gate on.
+        """
+        monkeypatch.setattr(
+            "mixpanel_headless._internal.api_client.is_emscripten", lambda: True
+        )
+
+        def _fail(*_args: object, **_kwargs: object) -> httpx.Response:
+            """Fail the test if any shortlink HTTP request is attempted."""
+            raise AssertionError("resolve_short_link must not issue a request")
+
+        client = MixpanelAPIClient(session=make_session())
+        monkeypatch.setattr(client, "_get_short_link", _fail)
+
+        with pytest.raises(ShortLinkResolutionError) as exc_info:
+            client.resolve_short_link("AbC123")
+
+        exc = exc_info.value
+        assert exc.code == "SHORT_LINK_UNSUPPORTED_RUNTIME"
+        assert "full report URL" in str(exc)
+        assert exc.details["short_code"] == "AbC123"
+
+    def test_native_still_resolves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Off Emscripten the gate is inert and a normal 302 still resolves.
+
+        Args:
+            monkeypatch: pytest fixture used to force the Emscripten gate off.
+        """
+        monkeypatch.setattr(
+            "mixpanel_headless._internal.api_client.is_emscripten", lambda: False
+        )
+        target = "https://mixpanel.com/project/3/view/75/app/insights#EBrV5bW2u9Mw"
+        client = MixpanelAPIClient(session=make_session())
+        monkeypatch.setattr(
+            client,
+            "_get_short_link",
+            lambda _url: httpx.Response(302, headers={"Location": target}),
+        )
+
+        assert client.resolve_short_link("AbC123") == target

@@ -88,6 +88,13 @@ _BACKOFF_MAX_SECONDS = 60.0
 _SHORT_LINK_HREF_RE = re.compile(r'window\.location\.href\s*=\s*("(?:[^"\\]|\\.)*")')
 _SHORT_LINK_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _SHORT_LINK_HINT = "Open the shortlink in a browser and copy the full URL."
+# Emscripten/Pyodide cannot read a suppressed redirect (the browser fetch/XHR
+# stack follows 3xx transparently and hides Location), so shortlink resolution
+# is refused up front rather than misreported. See resolve_short_link().
+_SHORT_LINK_EMSCRIPTEN_HINT = (
+    "Shortlink resolution is unavailable in this runtime. Open the shortlink "
+    "in a browser and paste the full report URL instead."
+)
 
 
 def _explicit_workspace_params(workspace_id: int | None) -> dict[str, Any] | None:
@@ -4895,11 +4902,22 @@ class MixpanelAPIClient:
             QueryError: 403 (permission denied).
             RateLimitError: 429 on every retry attempt.
             ServerError: 5xx.
-            ShortLinkResolutionError: ``SHORT_LINK_NO_LOCATION`` for a 3xx
+            ShortLinkResolutionError: ``SHORT_LINK_UNSUPPORTED_RUNTIME`` under
+                Emscripten (see Note); ``SHORT_LINK_NO_LOCATION`` for a 3xx
                 without ``Location``; ``SHORT_LINK_UNEXPECTED_RESPONSE`` for a
                 200 whose body has no decodable, non-empty redirect script, or
                 for any other status.
             MixpanelHeadlessError: ``HTTP_ERROR`` on a transport failure.
+
+        Note:
+            Unsupported under Emscripten/Pyodide. Resolution depends on
+            *reading* a suppressed redirect, but the browser fetch/XHR stack
+            behind :class:`PyfetchTransport` follows redirects transparently
+            and does not expose ``Location``. The request would therefore land
+            on the final HTML — or on a login page — and be misreported as
+            ``SHORT_LINK_UNEXPECTED_RESPONSE`` or a silent auth miss, so the
+            method refuses before issuing any request. Full report URLs and
+            slug links do not go through here and keep working.
 
         Example:
             ```python
@@ -4910,6 +4928,21 @@ class MixpanelAPIClient:
         """
         host = web_host(self.region)
         url = f"https://{host}/s/{code}"
+        if is_emscripten():
+            raise ShortLinkResolutionError(
+                f"Shortlink /s/{code} cannot be resolved in this runtime. "
+                f"Open the shortlink in a browser and paste the full report "
+                f"URL instead.",
+                code="SHORT_LINK_UNSUPPORTED_RUNTIME",
+                details={
+                    "kind": "short_link",
+                    "short_code": code,
+                    "host": host,
+                    "region": self.region,
+                    "runtime": "emscripten",
+                    "hint": _SHORT_LINK_EMSCRIPTEN_HINT,
+                },
+            )
         logger.debug("resolving shortlink /s/%s on %s", code, host)
         response = self._get_short_link(url)
 
