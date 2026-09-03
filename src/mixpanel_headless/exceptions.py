@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 from urllib.parse import urlencode
 
 if TYPE_CHECKING:
@@ -133,6 +133,105 @@ class MixpanelHeadlessError(Exception):
         return (
             f"{self.__class__.__name__}(message={self._message!r}, code={self._code!r})"
         )
+
+
+# Coded guard errors (E2 coding pass) - dual-inheritance domain errors that
+# replace raw ``raise ValueError`` / ``raise TypeError`` argument guards while
+# staying catchable as the original builtin (R5.5 registry-coded guards).
+
+
+class ParamValidationError(MixpanelHeadlessError, ValueError):
+    """A builder/facade argument guard rejected a value (registry-coded).
+
+    Dual-inherits from :class:`MixpanelHeadlessError` and :class:`ValueError`
+    so converted guard sites keep byte-identical messages and remain
+    catchable by existing ``except ValueError`` handlers, while carrying a
+    machine-readable registry ``.code`` for the conformance contract (R5.3).
+
+    Example:
+        ```python
+        try:
+            Filter.on("plan").in_the_last(0, "days")
+        except ParamValidationError as exc:
+            exc.code  # "FD1_QUANTITY_NOT_POSITIVE"
+        ```
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "VALIDATION_ERROR",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize the coded guard error.
+
+        Args:
+            message: Human-readable error message (byte-identical to the
+                pre-conversion builtin message at each converted site).
+            code: Machine-readable registry code for the violated rule.
+                Defaults to the generic ``VALIDATION_ERROR`` (R5.5
+                construction-path fallback).
+            details: Optional structured, deterministic, codec-encodable
+                data about the error.
+        """
+        super().__init__(message, code=code, details=details)
+
+
+class ParamTypeError(MixpanelHeadlessError, TypeError):
+    """A builder/facade argument guard rejected a value's type (registry-coded).
+
+    Dual-inherits from :class:`MixpanelHeadlessError` and :class:`TypeError`
+    so converted guard sites keep byte-identical messages and remain
+    catchable by existing ``except TypeError`` handlers, while carrying a
+    machine-readable registry ``.code`` for the conformance contract (R5.3).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "VALIDATION_ERROR",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize the coded guard error.
+
+        Args:
+            message: Human-readable error message (byte-identical to the
+                pre-conversion builtin message at each converted site).
+            code: Machine-readable registry code for the violated rule.
+                Defaults to the generic ``VALIDATION_ERROR`` (R5.5
+                construction-path fallback).
+            details: Optional structured, deterministic, codec-encodable
+                data about the error.
+        """
+        super().__init__(message, code=code, details=details)
+
+
+class ResponseValidationError(MixpanelHeadlessError):
+    """An API response failed Pydantic model validation.
+
+    Raised at response-parsing seams when a Mixpanel API payload does not
+    match the expected response model. Deliberately does NOT subclass
+    ``ValueError`` (unlike ``pydantic.ValidationError``) — the wrap is a
+    real, sanctioned behavior change recorded by ruling E2. The original
+    pydantic error is chained via ``raise ... from exc``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "RESPONSE_VALIDATION_ERROR",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize the response validation error.
+
+        Args:
+            message: Human-readable error message.
+            code: Machine-readable error code. Defaults to the generic
+                ``RESPONSE_VALIDATION_ERROR`` (R5.5).
+            details: Optional structured data — typically the response
+                model name and ``pydantic`` error list.
+        """
+        super().__init__(message, code=code, details=details)
 
 
 # API Exceptions - Base class for HTTP errors
@@ -553,6 +652,7 @@ class AuthenticationError(APIError):
         request_method: str | None = None,
         request_url: str | None = None,
         request_params: dict[str, Any] | None = None,
+        request_body: dict[str, Any] | None = None,
     ) -> None:
         """Initialize AuthenticationError.
 
@@ -563,6 +663,8 @@ class AuthenticationError(APIError):
             request_method: HTTP method used.
             request_url: Full request URL.
             request_params: Query parameters sent.
+            request_body: Request body sent (for POST/PATCH requests), so a
+                401 carries the same context as the other error branches.
         """
         super().__init__(
             message,
@@ -571,6 +673,7 @@ class AuthenticationError(APIError):
             request_method=request_method,
             request_url=request_url,
             request_params=request_params,
+            request_body=request_body,
             code="AUTH_FAILED",
         )
 
@@ -1522,3 +1625,312 @@ class UnsupportedReplayFormatError(SessionReplayError):
 
     _DEFAULT_CODE = "UNSUPPORTED_REPLAY_FORMAT"
     _DEFAULT_STATUS = 501
+
+
+# =============================================================================
+# Report-link exceptions (045-report-links)
+# =============================================================================
+
+
+class ReportLinkError(MixpanelHeadlessError):
+    """Base class for report-link failures (045-report-links).
+
+    Report links are Mixpanel web URLs that open a report in the browser.
+    Most failures in this family are local — a link that does not parse, a
+    link that points at another project or region, or a link kind that
+    headless cannot resolve — so the base is :class:`MixpanelHeadlessError`
+    rather than :class:`APIError`. The HTTP-shaped failures,
+    :class:`ReportLinkNotFoundError` and :class:`ShortLinkResolutionError`,
+    carry the parsed link fields in ``details`` instead of HTTP context.
+
+    Subclasses: :class:`ReportLinkParseError`,
+    :class:`UnsupportedReportLinkError`, :class:`ReportLinkNotFoundError`,
+    :class:`ReportLinkScopeMismatchError`, :class:`ShortLinkResolutionError`.
+
+    Not in this family: the pure URL builders and ``create_report_link``
+    input guards raise :class:`ParamValidationError` with the codes
+    ``RL1_UNKNOWN_REPORT_TYPE``, ``RL2_INVALID_SLUG``, ``RL3_UNKNOWN_REGION``,
+    ``RL4_REPORT_TYPE_CONFLICT``, ``RL5_RESOLVED_REPORT_INCONSISTENT``, and
+    ``RL6_INVALID_ID``. A ``try/except ReportLinkError`` does not catch them. Every failure in this
+    family carries a ``hint`` in ``details``.
+
+    Example:
+        ```python
+        try:
+            resolved = ws.resolve_report_link(link)
+        except ReportLinkError as exc:
+            print(exc.code, exc.details.get("hint"))
+        ```
+    """
+
+    _DEFAULT_CODE = "REPORT_LINK_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize a report-link error.
+
+        Args:
+            message: Human-readable error message; see
+                ``specs/045-report-links/contracts/error-messages.md`` for the
+                stable wording per code.
+            code: Machine-readable error code. Defaults to the subclass's
+                ``_DEFAULT_CODE``.
+            details: Parsed link fields that are available (``kind``,
+                ``region``, ``project_id``, ``workspace_id``, ``slug``,
+                ``bookmark_id``, ``short_code``) plus ``hint`` when one exists.
+        """
+        super().__init__(
+            message,
+            code=code if code is not None else self._DEFAULT_CODE,
+            details=details,
+        )
+
+
+class ReportLinkParseError(ReportLinkError):
+    """The input string is not a recognizable Mixpanel report link.
+
+    Codes: ``REPORT_LINK_UNPARSEABLE`` (default),
+    ``REPORT_LINK_NOT_MIXPANEL_HOST``, ``REPORT_LINK_UNRECOGNIZED_PATH``,
+    ``REPORT_LINK_UNRECOGNIZED_HASH``, ``REPORT_LINK_EMPTY_HASH``. The parser
+    is total: this is the only exception it raises for any input string.
+    """
+
+    _DEFAULT_CODE = "REPORT_LINK_UNPARSEABLE"
+
+
+class UnsupportedReportLinkError(ReportLinkError):
+    """The link was recognized but headless cannot resolve or run it.
+
+    Codes: ``UNSUPPORTED_REPORT_LINK`` (default), ``UNSUPPORTED_LEGACY_HASH``
+    (a ``~(...)`` JSURL hash), ``UNSUPPORTED_DASHBOARD_LINK`` (a board, not a
+    single report), ``UNSUPPORTED_REPORT_TYPE`` (for example
+    ``launch-analysis`` passed to ``query_report_link``).
+    """
+
+    _DEFAULT_CODE = "UNSUPPORTED_REPORT_LINK"
+
+
+class ReportLinkNotFoundError(ReportLinkError):
+    """The slug, saved report, or shortlink does not exist in scope.
+
+    Codes: ``REPORT_LINK_NOT_FOUND`` (default), ``REPORT_LINK_SLUG_NOT_FOUND``,
+    ``REPORT_LINK_BOOKMARK_NOT_FOUND``, ``SHORT_LINK_NOT_FOUND``. A slug is
+    readable only in the project and region that created it, so a 404 on a
+    slug often means the caller is on the wrong project.
+    """
+
+    _DEFAULT_CODE = "REPORT_LINK_NOT_FOUND"
+
+
+class ReportLinkScopeMismatchError(ReportLinkError):
+    """The link names a project or region other than the active session.
+
+    Codes: ``REPORT_LINK_SCOPE_MISMATCH`` (default),
+    ``REPORT_LINK_PROJECT_MISMATCH``, ``REPORT_LINK_REGION_MISMATCH``,
+    ``REPORT_LINK_WORKSPACE_MISMATCH`` (only when the session pins a
+    workspace and the link names a different one). The region check runs
+    before any HTTP call. The project and workspace checks run before the
+    record fetch; for a shortlink that is after the one redirect GET, because
+    the target is not known before it. The message names both values, and
+    ``details["hint"]`` names the ``ws.use(...)`` call and the ``mp --account``,
+    ``mp --project``, or ``mp --workspace`` flag that fixes it.
+    """
+
+    _DEFAULT_CODE = "REPORT_LINK_SCOPE_MISMATCH"
+
+
+class ShortLinkResolutionError(ReportLinkError):
+    """A ``/s/{code}`` shortlink could not be expanded to a full report URL.
+
+    Codes: ``SHORT_LINK_RESOLUTION_ERROR`` (default), ``SHORT_LINK_NO_LOCATION``
+    (3xx without ``Location``), ``SHORT_LINK_UNEXPECTED_RESPONSE`` (200 body
+    without the ``window.location.href`` script), ``SHORT_LINK_CHAIN`` (the
+    target is another shortlink; headless follows one redirect only).
+    """
+
+    _DEFAULT_CODE = "SHORT_LINK_RESOLUTION_ERROR"
+
+
+# =============================================================================
+# Coded-guard registry (E2 coding pass)
+# =============================================================================
+
+CODED_GUARD_REGISTRY: Final[frozenset[str]] = frozenset(
+    {
+        # -- B1: types.py cohort/metric families (design §1.1) --------------
+        "CF1_COHORT_ID_NOT_POSITIVE",
+        "CB1_COHORT_ID_NOT_POSITIVE",
+        "CM1_COHORT_ID_NOT_POSITIVE",
+        "CF2_COHORT_NAME_EMPTY",
+        "CB2_COHORT_NAME_EMPTY",
+        "CM2_COHORT_NAME_EMPTY",
+        "CD9_EMPTY_CRITERIA",
+        # -- B1: types.py CohortCriteria / cohort helpers (design §1.2) -----
+        "CD4_EMPTY_EVENT",
+        "CA1_AGGREGATION_PAIR",
+        "CA2_EMPTY_AGGREGATION_PROPERTY",
+        "CD1_FREQUENCY_PARAM_REQUIRED",
+        "CD2_FREQUENCY_NEGATIVE",
+        "CD3_TIME_CONSTRAINT_REQUIRED",
+        "CD3_WINDOW_NOT_POSITIVE",
+        "CD5_FROM_REQUIRES_TO",
+        "CD5_TO_REQUIRES_FROM",
+        "CD6_DATE_FORMAT",
+        "CD6_DATE_ORDER",
+        "CD6_DATE_INVALID",
+        "CD7_EMPTY_PROPERTY",
+        "CD8_COHORT_ID_NOT_POSITIVE",
+        "CD10_UNSUPPORTED_FILTER_OPERATOR",
+        # -- B1: types.py query-builder dataclass guards (design §1.3) ------
+        "TC0_INVALID_TYPE",
+        "TC1_REQUIRES_UNIT",
+        "TC1B_INVALID_UNIT",
+        "TC1_REJECTS_DATE",
+        "TC2_REQUIRES_DATE",
+        "TC2_REJECTS_UNIT",
+        "TC3_DATE_FORMAT",
+        "TC3B_DATE_INVALID",
+        "MT2_INVALID_SEGMENT_METHOD",
+        "FM1_EMPTY_EXPRESSION",
+        "LC1_MISSING_ITEM_FILTERS",
+        "LC2_MISSING_QUANTIFIER",
+        "FD1_QUANTITY_NOT_POSITIVE",
+        "FD2_DATE_ORDER",
+        "LC3_MIXED_ARGS",
+        "LC4_INVALID_QUANTIFIER",
+        "LC5_EMPTY_KWARG_KEY",
+        "LC6_KWARG_VALUE_TYPE",
+        "LC7_NO_CONDITIONS",
+        "LC8_NESTED_LIST_CONTAINS",
+        "LG1_EMPTY_SUB",
+        "LG2_INVALID_SUB_TYPE",
+        "GB1_EMPTY_PROPERTY",
+        "GB4_LIST_ITEM_BUCKETING",
+        "GB5_LIST_ITEM_PROPERTY_TYPE",
+        "EV1_EMPTY_EVENT",
+        "EV2_CONTROL_CHAR_EVENT",
+        "FB1_EMPTY_EVENT",
+        "FB2_BUCKET_SIZE_NOT_POSITIVE",
+        "FB3_BUCKET_ORDER",
+        "FB4_BUCKET_MIN_NEGATIVE",
+        "FF1_EMPTY_EVENT",
+        "FF2_INVALID_OPERATOR",
+        "FF3_VALUE_NEGATIVE",
+        "FF4_DATE_RANGE_PAIR",
+        "FF5_DATE_RANGE_VALUE_NOT_POSITIVE",
+        "EX1_FROM_STEP_NEGATIVE",
+        "EX2_STEP_ORDER",
+        "HC1_EMPTY_PROPERTY",
+        "FS1_SESSION_EVENT_MISMATCH",
+        # -- B1: types.py result/replay-model invariants (design §1.4) ------
+        # NOTE: the design's AT1/AT2/AT3 codes (AccountTestResult) are NOT
+        # minted: `AccountTestResult._ok_iff_no_error` is a pydantic
+        # `@model_validator`, so those three raise sites fall under the
+        # design's own P3 policy (a ValueError subclass raised inside a
+        # pydantic validator is wrapped into pydantic.ValidationError and
+        # the code is lost — verified empirically). They keep the builtin
+        # raise; their contract is the generic VALIDATION_ERROR boundary.
+        "RS1_EMPTY_REPLAY_ID",
+        "RS2_PROJECT_ID_NOT_POSITIVE",
+        "RS3_START_TIME_NOT_POSITIVE",
+        "RS4_INVALID_RETENTION_DAYS",
+        "SR1_URL_NO_TRAILING_SLASH",
+        "SR2_EMPTY_QUERY_STRING",
+        "SR3_INVALID_ENV",
+        "SR4_SIGNED_AT_NEGATIVE",
+        "UA1_TIMESTAMP_NOT_POSITIVE",
+        "UA2_EMPTY_TARGET_DESC",
+        "RE1_EMPTY_REPLAY_ID",
+        "RE2_EMPTY_EVENT_NAME",
+        "RE3_EVENT_TIME_NOT_POSITIVE",
+        "RP1_EMPTY_REPLAY_ID",
+        "RP2_PROJECT_ID_NOT_POSITIVE",
+        "RP3_START_TIME_NOT_POSITIVE",
+        "RP4_TIME_ORDER",
+        "RP5_INVALID_RETENTION_DAYS",
+        "RB1_PROJECT_ID_MISMATCH",
+        # -- B2: bookmark_builders.py + segfilter.py (design §1.5) ----------
+        "BB1_GROUP_BY_ELEMENT_TYPE",
+        "BB2_FLOW_PROPERTY_FILTER_EMPTY",
+        "BB3_FLOW_PROPERTY_FILTER_TYPE",
+        "BB4_FLOW_COHORT_FILTER_TYPE",
+        "BB5_FLOW_MULTIPLE_COHORT_FILTERS",
+        "BB6_COHORT_VALUE_NOT_LIST",
+        "BB7_COHORT_VALUE_NOT_DICT",
+        "BB8_COHORT_KEY_MISSING",
+        "SG1_UNKNOWN_STRING_OPERATOR",
+        "SG2_UNKNOWN_NUMBER_OPERATOR",
+        "SG3_UNKNOWN_DATETIME_OPERATOR",
+        "SG4_UNSUPPORTED_PROPERTY_TYPE",
+        # -- B3: user_builders.py + workspace.py + api_client.py (§1.6/§1.7) -
+        "ES1_PROPERTY_NOT_STRING",
+        "ES2_EQUALS_EXPECTS_LIST",
+        "ES3_EQUALS_NO_TERMS",
+        "ES4_NOT_EQUALS_EXPECTS_LIST",
+        "ES5_NOT_EQUALS_NO_TERMS",
+        "ES6_CONTAINS_EXPECTS_STR",
+        "ES7_NOT_CONTAINS_EXPECTS_STR",
+        "ES8_GT_EXPECTS_NUMBER",
+        "ES9_LT_EXPECTS_NUMBER",
+        "ES10_BETWEEN_EXPECTS_PAIR",
+        "ES11_BETWEEN_LOWER_NOT_NUMBER",
+        "ES12_BETWEEN_UPPER_NOT_NUMBER",
+        "ES13_UNSUPPORTED_OPERATOR",
+        "WR1_TOO_MANY_EVENT_PROPERTIES",
+        "WR2_LIMIT_TOO_SMALL",
+        "WR3_LIMIT_TOO_LARGE",
+        "WR4_REPLAY_SELECTOR_REQUIRED",
+        "WR5_DATE_RANGE_REQUIRED",
+        "WS1_TARGET_MUTUALLY_EXCLUSIVE",
+        "WS2_INVALID_LEVEL",
+        "AC1_BODY_MUTUALLY_EXCLUSIVE",
+        "AC2_DISTINCT_ID_CONFLICT",
+        "AC3_BEHAVIORS_COHORT_CONFLICT",
+        "AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT",
+        "AC5_BEHAVIORS_NOT_LIST",
+        "AC6_AS_OF_TIMESTAMP_FUTURE",
+        "RESPONSE_VALIDATION_ERROR",
+        # -- 045-report-links: pure URL builder + create_report_link guards --
+        "RL1_UNKNOWN_REPORT_TYPE",
+        "RL2_INVALID_SLUG",
+        "RL3_UNKNOWN_REGION",
+        "RL4_REPORT_TYPE_CONFLICT",
+        "RL5_RESOLVED_REPORT_INCONSISTENT",
+        "RL6_INVALID_ID",
+    }
+)
+"""Every full error code minted by the E2 uncoded-raise coding pass.
+
+Single source of truth for the codes newly introduced by the coding pass
+(design ``context/phase1/addendum/coding-pass-design.md`` §1), importable by
+tests (code-uniqueness guard) and the conformance recorder. Reused twin
+codes are listed separately in :data:`CODED_GUARD_TWIN_CODES` — they
+pre-exist in the registry and are deliberately NOT minted here.
+"""
+
+CODED_GUARD_TWIN_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "CM5_INLINE_COHORT_METRIC",
+        "V13_METRIC_MATH_PROPERTY",
+        "V26_PERCENTILE_REQUIRES_VALUE",
+        "V8_DATE_FORMAT",
+        "V8_DATE_INVALID",
+        "V12_BUCKET_SIZE_POSITIVE",
+        "V18_BUCKET_ORDER",
+        "FL3_FORWARD_RANGE",
+        "FL4_REVERSE_RANGE",
+    }
+)
+"""Pre-existing registry codes reused by dual-enforcement guard twins.
+
+Each converted fail-fast guard that duplicates an already-coded validator
+rule (the documented CM5 dual-enforcement pattern) carries the same full
+code as its validator twin; rule-identity was verified per site (design §1
+"Twin reuse"). These codes already exist in the code universe and are NOT
+part of :data:`CODED_GUARD_REGISTRY`.
+"""

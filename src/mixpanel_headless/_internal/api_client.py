@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -48,14 +48,19 @@ from mixpanel_headless._internal.me import (
     select_workspace_id,
 )
 from mixpanel_headless._internal.pyodide_transport import PyfetchTransport
+from mixpanel_headless._internal.report_links import web_host
+from mixpanel_headless._internal.response_validation import validate_response_models
 from mixpanel_headless._internal.runtime import is_emscripten
 from mixpanel_headless.exceptions import (
     AuthenticationError,
     MixpanelHeadlessError,
+    ParamValidationError,
     QueryError,
     RateLimitError,
+    ReportLinkNotFoundError,
     ServerError,
     SessionReplayAccessError,
+    ShortLinkResolutionError,
     WorkspaceScopeError,
 )
 from mixpanel_headless.types import ProfilePageResult, PublicWorkspace
@@ -70,6 +75,77 @@ logger = logging.getLogger(__name__)
 # a transient failure. They let auto-resolution fall through to the next source
 # instead of aborting; 5xx / 401 / 429 / network errors still propagate.
 _FALLBACK_HTTP_STATUSES = frozenset({403, 404})
+
+# Exponential-backoff bounds shared by _calculate_backoff() and the
+# Retry-After clamp. A server-supplied Retry-After is honored up to
+# _BACKOFF_MAX_SECONDS; anything larger would park the process for hours.
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 60.0
+
+# 045-report-links: the shortlink view returns 200 HTML instead of a 3xx when
+# the target URL is longer than ~2048 chars. The body then carries the target
+# as a JSON-quoted string assigned to window.location.href.
+_SHORT_LINK_HREF_RE = re.compile(r'window\.location\.href\s*=\s*("(?:[^"\\]|\\.)*")')
+_SHORT_LINK_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_SHORT_LINK_HINT = "Open the shortlink in a browser and copy the full URL."
+
+
+def _explicit_workspace_params(workspace_id: int | None) -> dict[str, Any] | None:
+    """Build the query params that carry an explicit data view, or ``None``.
+
+    ``_request`` injects the pinned workspace with ``setdefault``, so a
+    ``workspace_id`` placed here wins over the pin. ``None`` leaves the
+    params empty and the pin rule unchanged.
+
+    Args:
+        workspace_id: The data view to run under, or ``None``.
+
+    Returns:
+        ``{"workspace_id": workspace_id}`` or ``None``.
+    """
+    if workspace_id is None:
+        return None
+    return {"workspace_id": workspace_id}
+
+
+def _error_message(response_body: str | dict[str, Any] | None, default: str) -> str:
+    """Extract a human-readable error message from a parsed error body.
+
+    Mixpanel error bodies are either a JSON object with an ``error`` key, a
+    plain-text blob, or nothing at all. Any of those can be empty or blank,
+    which must not produce a blank exception message.
+
+    Args:
+        response_body: Parsed JSON object, raw text, or None.
+        default: Message to use when the body carries no usable error text.
+
+    Returns:
+        The extracted message, or ``default`` when the body is missing,
+        blank, or has no ``error`` key. Non-string ``error`` values (lists,
+        nested objects) are stringified rather than returned as-is.
+
+    Example:
+        ```python
+        _error_message({"error": "Invalid project"}, "Request failed")
+        # "Invalid project"
+        _error_message({"error": ["bad steps", "bad dates"]}, "Request failed")
+        # "['bad steps', 'bad dates']"
+        _error_message("   ", "Request failed")
+        # "Request failed"  (blank text falls back to the default)
+        _error_message(None, "Request failed")
+        # "Request failed"
+        ```
+    """
+    if isinstance(response_body, dict):
+        raw = response_body.get("error")
+        if raw is None:
+            return default
+        text = raw if isinstance(raw, str) else str(raw)
+    elif isinstance(response_body, str):
+        text = response_body[:200]
+    else:
+        return default
+    return text if text.strip() else default
 
 
 def _iter_jsonl_lines(response: httpx.Response) -> Iterator[str]:
@@ -136,6 +212,18 @@ ENDPOINTS: dict[str, dict[str, str]] = {
         "app": "https://in.mixpanel.com/api/app",
     },
 }
+
+# Server-side read deadlines Mixpanel's edge enforces per route family
+# (nginx ``proxy_read_timeout``): App API routes get ~120s; ``/api/query``
+# routes get 488s. The route-aware client defaults below add a margin so a
+# slow request is always resolved by the server's own answer (success or
+# 5xx with diagnostics) and never pre-empted by a client read timeout. An
+# explicit ``timeout`` (constructor or per-call) overrides them.
+APP_API_SERVER_DEADLINE_S: float = 120.0
+QUERY_API_SERVER_DEADLINE_S: float = 488.0
+_SERVER_DEADLINE_MARGIN_S: float = 15.0
+DEFAULT_APP_TIMEOUT_S: float = APP_API_SERVER_DEADLINE_S + _SERVER_DEADLINE_MARGIN_S
+DEFAULT_QUERY_TIMEOUT_S: float = QUERY_API_SERVER_DEADLINE_S + _SERVER_DEADLINE_MARGIN_S
 
 
 def _parse_feed_date(value: str, field: str) -> datetime:
@@ -215,97 +303,6 @@ def _build_activity_feed_date_range(
     return {"type": "relative_after", "window": {"unit": "day", "value": 30}}
 
 
-# Cap on how much error-body text is inlined into an exception message. The full
-# (untruncated) body always remains available on the exception's
-# ``response_body`` attribute; this keeps ``str(exc)`` readable.
-_ERROR_DETAIL_MAX_CHARS = 500
-
-
-def _stringify_error_detail(value: object) -> str:
-    """Render an arbitrary error-body value as a compact, legible string.
-
-    HTTP error bodies come from ``response.json()`` and are typed ``Any``, so a
-    value pulled from one (e.g. ``body["error"]``) may be a ``str``, ``dict``,
-    ``list``, or scalar. Passing a non-``str`` as an exception message violates
-    the ``MixpanelHeadlessError`` contract and historically crashed ``str(exc)``
-    with ``TypeError: __str__ returned non-string``. Coercing any value to a
-    string here keeps the detail safe to embed in a message.
-
-    Args:
-        value: The raw error detail. A ``str`` is returned unchanged;
-            ``dict``/``list`` are rendered as compact, key-sorted JSON (falling
-            back to ``str()`` when not JSON-serializable); any other type uses
-            ``str()``.
-
-    Returns:
-        A string rendering of ``value``.
-
-    Example:
-        ```python
-        _stringify_error_detail("bad field")
-        # 'bad field'
-        _stringify_error_detail({"code": "invalid", "field": "name"})
-        # '{"code": "invalid", "field": "name"}'
-        ```
-    """
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _extract_api_error_message(
-    response_body: str | dict[str, Any] | None,
-    *,
-    status_code: int,
-    default: str,
-) -> str:
-    """Build an actionable, guaranteed-``str`` message from an HTTP error body.
-
-    Extracts the human-facing detail from a parsed error response, preferring
-    the body's ``"error"`` field, then the whole body, then ``default`` — always
-    coercing to a string (see :func:`_stringify_error_detail`) and prefixing the
-    HTTP status so ``str(exc)`` is self-describing. This fixes the live
-    dashboard-PATCH failure, where a dict-valued ``"error"`` reached
-    ``QueryError(message=...)`` and crashed ``str(exc)``; the structured body is
-    still preserved verbatim on the exception's ``response_body`` attribute.
-
-    Args:
-        response_body: Parsed response body — a ``dict`` (JSON object), a
-            ``str`` (non-JSON text), or ``None`` when there was no body.
-        status_code: HTTP status code, prefixed into the returned message.
-        default: Fallback detail used when the body carries no usable text.
-
-    Returns:
-        A string of the form ``"[HTTP <status>] <detail>"``, with ``<detail>``
-        truncated to a sane length (the full body remains on ``response_body``).
-
-    Example:
-        ```python
-        _extract_api_error_message(
-            {"error": "bad field"}, status_code=400, default="Unknown error"
-        )
-        # '[HTTP 400] bad field'
-        _extract_api_error_message(None, status_code=404, default="Not found")
-        # '[HTTP 404] Not found'
-        ```
-    """
-    if isinstance(response_body, dict):
-        if "error" in response_body:
-            detail = _stringify_error_detail(response_body["error"])
-        else:
-            detail = _stringify_error_detail(response_body)
-    elif isinstance(response_body, str) and response_body:
-        detail = response_body
-    else:
-        detail = default
-    if len(detail) > _ERROR_DETAIL_MAX_CHARS:
-        detail = detail[:_ERROR_DETAIL_MAX_CHARS] + "…"
-    return f"[HTTP {status_code}] {detail}"
-
-
 # Map the resource-type spellings callers pass (lowercase / plural / snake-era) to the
 # App API's canonical Lexicon values. The data-definitions endpoints accept only the
 # camelCase ``resourceType`` query param with a capitalized value ("Event"/"User"); a
@@ -364,7 +361,7 @@ class MixpanelAPIClient:
         self,
         *,
         session: Session,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         export_timeout: float = 600.0,
         max_retries: int = 3,
         token_resolver: TokenResolver | None = None,
@@ -374,7 +371,13 @@ class MixpanelAPIClient:
 
         Args:
             session: Resolved Session (account + project + optional workspace).
-            timeout: Request timeout in seconds for regular requests.
+            timeout: Request timeout in seconds for regular requests. When
+                ``None`` (the default), each request gets a route-aware
+                timeout sized to outlast the server's own deadline
+                (:data:`DEFAULT_APP_TIMEOUT_S` for App API routes,
+                :data:`DEFAULT_QUERY_TIMEOUT_S` otherwise), so the server —
+                not this client — resolves a slow request. An explicit value
+                applies to every request.
             export_timeout: Request timeout for export operations.
             max_retries: Maximum retry attempts for rate-limited requests.
             token_resolver: For OAuth accounts; defaults to
@@ -395,7 +398,7 @@ class MixpanelAPIClient:
             if isinstance(session.account, ServiceAccount)
             else None
         )
-        self._timeout = timeout
+        self._timeout: float | None = timeout
         self._export_timeout = export_timeout
         self._max_retries = max_retries
         self._client: httpx.Client | None = None
@@ -512,10 +515,37 @@ class MixpanelAPIClient:
         """
         if self._client is None:
             self._client = httpx.Client(
-                timeout=self._timeout,
+                # Pool-level fallback only — every request path passes a
+                # per-request timeout. Sized to the largest route default so
+                # it can never pre-empt a server-side deadline.
+                timeout=(
+                    self._timeout
+                    if self._timeout is not None
+                    else DEFAULT_QUERY_TIMEOUT_S
+                ),
                 transport=self._transport,
             )
         return self._client
+
+    def _default_timeout(self, url: str) -> float:
+        """Resolve the read timeout for a request to ``url``.
+
+        An explicit constructor ``timeout`` wins. Otherwise the default is
+        route-aware and sized to outlast the server's own read deadline
+        (~120s on App API routes, 488s on query routes), so the server —
+        never this client — is the side that resolves a slow request.
+
+        Args:
+            url: The full request URL.
+
+        Returns:
+            The timeout in seconds for the request.
+        """
+        if self._timeout is not None:
+            return self._timeout
+        if url.startswith(ENDPOINTS[self._session.account.region]["app"]):
+            return DEFAULT_APP_TIMEOUT_S
+        return DEFAULT_QUERY_TIMEOUT_S
 
     def _request_headers(self, extra: dict[str, str]) -> dict[str, str]:
         """Compose the per-request header set: defaults → env → session → caller.
@@ -623,16 +653,22 @@ class MixpanelAPIClient:
                 request_method=request_method,
                 request_url=request_url,
                 request_params=request_params,
+                request_body=request_body,
             )
         if response.status_code == 403:
             # 044-session-replay: a 403 mentioning SESSION_RECORDING_SENSITIVE_DATA
             # means the project's sensitive-data flag is set and the caller lacks
             # the `sensitive_data_replay` permission. Map to SessionReplayAccessError
             # so callers can branch on it instead of pattern-matching the message.
+            # `response.json()` can yield ANY JSON value (dict, list, str,
+            # number, bool, null) — serialize every non-str body so the
+            # substring sniff below is uniform across shapes and can never
+            # raise TypeError on a scalar body (see
+            # context/phase3/bug-reports/python-handle-response-403-typeerror.md).
             body_text = (
-                json.dumps(response_body)
-                if isinstance(response_body, dict)
-                else (response_body or "")
+                response_body
+                if isinstance(response_body, str)
+                else ("" if response_body is None else json.dumps(response_body))
             )
             if "SESSION_RECORDING_SENSITIVE_DATA" in body_text:
                 project_id_int = int(self._session.project.id)
@@ -655,11 +691,7 @@ class MixpanelAPIClient:
                     request_params=request_params,
                     request_body=request_body,
                 )
-            error_msg = _extract_api_error_message(
-                response_body,
-                status_code=response.status_code,
-                default="Permission denied",
-            )
+            error_msg = _error_message(response_body, "Permission denied")
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -670,11 +702,7 @@ class MixpanelAPIClient:
                 request_body=request_body,
             )
         if response.status_code == 400:
-            error_msg = _extract_api_error_message(
-                response_body,
-                status_code=response.status_code,
-                default="Unknown error",
-            )
+            error_msg = _error_message(response_body, "Unknown error")
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -685,11 +713,7 @@ class MixpanelAPIClient:
                 request_body=request_body,
             )
         if response.status_code == 404:
-            error_msg = _extract_api_error_message(
-                response_body,
-                status_code=response.status_code,
-                default="Resource not found",
-            )
+            error_msg = _error_message(response_body, "Resource not found")
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -703,11 +727,7 @@ class MixpanelAPIClient:
             # Any other 4xx (e.g., 412 Precondition Failed) — preserve the
             # response body and status as a QueryError instead of letting it
             # fall through to a generic HTTP error in _execute_with_retry().
-            error_msg = _extract_api_error_message(
-                response_body,
-                status_code=response.status_code,
-                default="Request failed",
-            )
+            error_msg = _error_message(response_body, "Request failed")
             raise QueryError(
                 error_msg,
                 status_code=response.status_code,
@@ -719,11 +739,9 @@ class MixpanelAPIClient:
             )
         if response.status_code >= 500:
             # Extract error message from response body if available
-            error_msg = f"Server error: {response.status_code}"
-            if isinstance(response_body, dict) and "error" in response_body:
-                error_msg = f"Server error: {response_body['error']}"
-            elif isinstance(response_body, str) and response_body:
-                error_msg = f"Server error: {response_body[:200]}"
+            error_msg = "Server error: " + _error_message(
+                response_body, str(response.status_code)
+            )
 
             raise ServerError(
                 error_msg,
@@ -761,11 +779,32 @@ class MixpanelAPIClient:
         Returns:
             Delay in seconds including jitter.
         """
-        base = 1.0
-        max_delay = 60.0
-        delay: float = min(base * (2**attempt), max_delay)
+        delay: float = min(_BACKOFF_BASE_SECONDS * (2**attempt), _BACKOFF_MAX_SECONDS)
         jitter: float = random.uniform(0, delay * 0.1)  # noqa: S311
         return delay + jitter
+
+    def _retry_wait_seconds(self, retry_after: int | None, attempt: int) -> float:
+        """Resolve how long to wait before retrying a rate-limited request.
+
+        ``Retry-After`` is server-controlled and therefore untrusted input.
+        ``_parse_retry_after`` already rejects unparseable and negative
+        values; this method additionally caps an implausibly large header
+        (``Retry-After: 86400``) at the same ceiling the exponential backoff
+        uses, so a single header can never park the process for hours.
+
+        Args:
+            retry_after: Validated Retry-After value in seconds, or None when
+                the header was absent or unusable.
+            attempt: Zero-based attempt number, used for the backoff fallback.
+
+        Returns:
+            A non-negative delay in seconds, at most ``_BACKOFF_MAX_SECONDS``
+            when it came from the header (the backoff fallback adds its own
+            jitter on top of that ceiling).
+        """
+        if retry_after is None:
+            return self._calculate_backoff(attempt)
+        return min(float(retry_after), _BACKOFF_MAX_SECONDS)
 
     def _execute_with_retry(
         self,
@@ -819,7 +858,7 @@ class MixpanelAPIClient:
                     json=json_data,
                     data=form_data,
                     headers=request_headers,
-                    timeout=timeout or self._timeout,
+                    timeout=timeout or self._default_timeout(url),
                 )
 
                 if response.status_code == 429:
@@ -842,11 +881,9 @@ class MixpanelAPIClient:
                             request_params=params,
                             project_id=self.project_id,
                         )
-                    retry_after = self._parse_retry_after(response)
-                    if retry_after is not None:
-                        wait_time = float(retry_after)
-                    else:
-                        wait_time = self._calculate_backoff(attempt)
+                    wait_time = self._retry_wait_seconds(
+                        self._parse_retry_after(response), attempt
+                    )
                     logger.warning(
                         "Rate limited, retrying in %.1f seconds (attempt %d/%d)",
                         wait_time,
@@ -895,11 +932,25 @@ class MixpanelAPIClient:
         form_data: dict[str, Any] | None = None,
         timeout: float | None = None,
         inject_project_id: bool = True,
+        inject_workspace_id: bool = True,
     ) -> Any:
-        """Make an authenticated request with optional project_id injection.
+        """Make an authenticated request with project/workspace param injection.
 
         Used internally by API methods. Handles rate limiting with exponential
         backoff.
+
+        Workspace scoping: when a workspace is explicitly pinned
+        (``Session.workspace`` at construction, ``set_workspace_id()``, or
+        ``use(workspace=...)``) and the URL is on the Query API host
+        (``/api/query``, which includes the engage/user-profile base), the pin
+        is injected as a ``workspace_id`` query parameter via ``setdefault`` —
+        a caller-supplied ``workspace_id`` in ``params`` always wins. This
+        makes Mixpanel data view filters apply to query and discovery calls.
+        The injection is EXPLICIT-ONLY: no pin means nothing is injected and
+        no workspace auto-resolution is triggered. The App API host scopes via
+        ``/workspaces/{id}/`` URL paths instead, and the raw export host
+        (``data.mixpanel.com``) stays project-scoped by design — data view
+        filters never apply to raw export streaming.
 
         Args:
             method: HTTP method (GET, POST, etc.).
@@ -907,10 +958,15 @@ class MixpanelAPIClient:
             params: Query parameters.
             data: Request body as JSON (for POST).
             form_data: Request body as form-encoded (for POST).
-            timeout: Override default timeout (uses self._timeout if not specified).
+            timeout: Override the route-aware default timeout (see
+                ``_default_timeout``) for this request.
             inject_project_id: If True (default), automatically adds project_id
                 to query params. Set to False for APIs where project_id is
                 already in the URL path (e.g., Lexicon Schemas API).
+            inject_workspace_id: If True (default), adds the explicitly pinned
+                workspace ID as ``workspace_id`` on Query-host requests. Set
+                to False to force a project-scoped query even when a
+                workspace is pinned.
 
         Returns:
             Parsed JSON response.
@@ -921,11 +977,33 @@ class MixpanelAPIClient:
             QueryError: Invalid parameters (400).
             ServerError: Server-side errors (5xx).
             MixpanelHeadlessError: Network/connection errors.
+
+        Example:
+            ```python
+            client.set_workspace_id(84)
+            url = client._build_url("query", "/events/names")
+            # Pin + Query host → workspace_id=84 injected alongside project_id
+            client._request("GET", url, params={"type": "general"})
+            # Opt out to force a project-wide query despite the pin
+            client._request(
+                "GET", url, params={"type": "general"}, inject_workspace_id=False
+            )
+            ```
         """
         if params is None:
             params = {}
         if inject_project_id:
             params["project_id"] = self._session.project.id
+        if inject_workspace_id and url.startswith(
+            ENDPOINTS[self._session.account.region]["query"]
+        ):
+            if self._workspace_id is not None:
+                params.setdefault("workspace_id", self._workspace_id)
+            else:
+                logger.debug(
+                    "_request - no workspace pinned; Query API call runs "
+                    "project-wide (data view filters do not apply)"
+                )
 
         logger.debug(
             "_request - method: %s, url: %s, final params: %s",
@@ -1077,6 +1155,14 @@ class MixpanelAPIClient:
         The underlying ``httpx.Client`` instance is preserved; only the
         ``_credentials`` shim and per-axis caches change.
 
+        Workspace scoping: ``use(workspace=W)`` pins the workspace, so
+        subsequent Query-host requests carry ``workspace_id=W`` and Mixpanel
+        data view filters apply (see :meth:`_request`); raw export streaming
+        stays project-scoped. Any call that does not supply ``workspace=``
+        (including a zero-axis ``use()``) clears both ``session.workspace``
+        and the pin, reverting queries to unscoped — the pin always tracks
+        the session's workspace axis.
+
         Args:
             account: Replacement account.
             project: Replacement project (``Project`` object or numeric-string
@@ -1116,13 +1202,15 @@ class MixpanelAPIClient:
         if account is not None or project is not None:
             self._resolved_workspace = new_session.workspace
             self._cached_workspace_id = None
-            # Sync the int-id pin with the new session — without this,
-            # `maybe_scoped_path()` keeps emitting `/workspaces/<old>/…`
-            # and routes requests to a workspace that may not exist under
-            # the new project / account.
-            self._workspace_id = (
-                new_session.workspace.id if new_session.workspace else None
-            )
+        # Sync the int-id pin with the new session unconditionally —
+        # without this, `maybe_scoped_path()` keeps emitting
+        # `/workspaces/<old>/…` (routing requests to a workspace that may
+        # not exist under the new project / account), and `_request()`
+        # keeps injecting a stale `workspace_id` on Query-host calls.
+        # The unconditional sync also covers the zero-axis case
+        # (`use()` with no arguments), where `Session.replace` clears
+        # `session.workspace` — the pin must follow it to None.
+        self._workspace_id = new_session.workspace.id if new_session.workspace else None
         if workspace_obj is not None:
             self._workspace_id = workspace_obj.id
             self._resolved_workspace = workspace_obj
@@ -1173,20 +1261,31 @@ class MixpanelAPIClient:
         return ref
 
     def _parse_retry_after(self, response: httpx.Response) -> int | None:
-        """Parse Retry-After header if present.
+        """Parse the Retry-After header if present and usable.
+
+        The header is attacker-controllable, so anything that is not a
+        non-negative integer count of seconds is treated as absent. In
+        particular a negative value is rejected: it would reach
+        ``time.sleep()`` (raising ValueError) and would be echoed as
+        ``RateLimitError.retry_after``, whose documented usage is
+        ``time.sleep(exc.retry_after or 60)``. HTTP-date form is not
+        supported and also reads as absent.
 
         Args:
             response: HTTP response.
 
         Returns:
-            Seconds to wait, or None if header not present.
+            Seconds to wait as a non-negative int, or None when the header is
+            missing, unparseable, or negative.
         """
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:
             try:
-                return int(retry_after)
+                parsed = int(retry_after)
             except ValueError:
-                pass
+                return None
+            if parsed >= 0:
+                return parsed
         return None
 
     # =========================================================================
@@ -1230,7 +1329,8 @@ class MixpanelAPIClient:
             response dict is returned without unwrapping ``results``.
 
         Raises:
-            ValueError: Both ``json_body`` and ``form_body`` were provided.
+            ParamValidationError: Both ``json_body`` and ``form_body`` were
+                provided (``AC1_BODY_MUTUALLY_EXCLUSIVE``).
             AuthenticationError: Invalid credentials (401).
             RateLimitError: Rate limit exceeded after max retries (429).
             QueryError: Invalid parameters or resource not found (400, 404, 422).
@@ -1253,8 +1353,9 @@ class MixpanelAPIClient:
             ```
         """
         if json_body is not None and form_body is not None:
-            raise ValueError(
-                "app_request: json_body and form_body are mutually exclusive"
+            raise ParamValidationError(
+                "app_request: json_body and form_body are mutually exclusive",
+                code="AC1_BODY_MUTUALLY_EXCLUSIVE",
             )
 
         url = self._build_url("app", path)
@@ -1287,7 +1388,7 @@ class MixpanelAPIClient:
                         params=request_params,
                         data=form_body,
                         headers=headers,
-                        timeout=self._timeout,
+                        timeout=self._default_timeout(url),
                     )
                 else:
                     response = client.request(
@@ -1296,7 +1397,7 @@ class MixpanelAPIClient:
                         params=request_params,
                         json=json_body,
                         headers=headers,
-                        timeout=self._timeout,
+                        timeout=self._default_timeout(url),
                     )
 
                 # Handle 204 No Content
@@ -1321,13 +1422,12 @@ class MixpanelAPIClient:
                             response_body=response_body,
                             request_method=method,
                             request_url=url,
+                            request_params=request_params,
                             project_id=self.project_id,
                         )
-                    retry_after = self._parse_retry_after(response)
-                    if retry_after is not None:
-                        wait_time = float(retry_after)
-                    else:
-                        wait_time = self._calculate_backoff(attempt)
+                    wait_time = self._retry_wait_seconds(
+                        self._parse_retry_after(response), attempt
+                    )
                     logger.warning(
                         "Rate limited, retrying in %.1f seconds (attempt %d/%d)",
                         wait_time,
@@ -1344,15 +1444,14 @@ class MixpanelAPIClient:
                         err_body = response.json()
                     except json.JSONDecodeError:
                         err_body = response.text[:500] if response.text else None
-                    error_msg = _extract_api_error_message(
-                        err_body, status_code=422, default="Unprocessable entity"
-                    )
+                    error_msg = _error_message(err_body, "Unprocessable entity")
                     raise QueryError(
                         error_msg,
                         status_code=422,
                         response_body=err_body,
                         request_method=method,
                         request_url=url,
+                        request_params=request_params,
                         request_body=request_body,
                     )
 
@@ -1378,6 +1477,7 @@ class MixpanelAPIClient:
                         "error": str(e),
                         "request_method": method,
                         "request_url": url,
+                        "request_params": request_params,
                     },
                 ) from e
 
@@ -1386,6 +1486,7 @@ class MixpanelAPIClient:
             "Rate limit exceeded after max retries",
             request_method=method,
             request_url=url,
+            request_params=request_params,
             project_id=self.project_id,
         )
 
@@ -1401,9 +1502,13 @@ class MixpanelAPIClient:
     def set_workspace_id(self, workspace_id: int | None) -> None:
         """Set or clear the explicit workspace ID for scoped requests.
 
-        When set, ``maybe_scoped_path()`` will use workspace-scoped paths.
-        Setting to ``None`` clears both the explicit ID and the cached
-        auto-discovered ID, reverting to project-scoped paths.
+        When set, ``maybe_scoped_path()`` will use workspace-scoped paths,
+        AND every Query-host request (queries, discovery, engage) carries a
+        ``workspace_id`` parameter so Mixpanel data view filters apply (see
+        :meth:`_request`). Raw export streaming remains project-scoped by
+        design. Setting to ``None`` clears both the explicit ID and the
+        cached auto-discovered ID, reverting to project-scoped paths and
+        unscoped queries.
 
         Args:
             workspace_id: Workspace ID to use, or None to clear.
@@ -1779,7 +1884,10 @@ class MixpanelAPIClient:
             AuthenticationError: Invalid credentials (401).
             QueryError: API error (400, 404).
             ServerError: Server-side errors (5xx).
-            MixpanelHeadlessError: Network/connection errors.
+            ResponseValidationError: A workspace entry fails model
+                validation (``RESPONSE_VALIDATION_ERROR``).
+            MixpanelHeadlessError: Network/connection errors, or a
+                non-list response payload.
 
         Example:
             ```python
@@ -1798,7 +1906,9 @@ class MixpanelAPIClient:
                 f"Unexpected response format from list_workspaces: "
                 f"expected list, got {type(results).__name__}",
             )
-        return [PublicWorkspace.model_validate(ws) for ws in results]
+        return validate_response_models(
+            PublicWorkspace, results, endpoint="list_workspaces"
+        )
 
     # =========================================================================
     # Export API - Streaming
@@ -1883,11 +1993,9 @@ class MixpanelAPIClient:
                                 request_params=params,
                                 project_id=self.project_id,
                             )
-                        retry_after = self._parse_retry_after(response)
-                        if retry_after is not None:
-                            wait_time = float(retry_after)
-                        else:
-                            wait_time = self._calculate_backoff(attempt)
+                        wait_time = self._retry_wait_seconds(
+                            self._parse_retry_after(response), attempt
+                        )
                         time.sleep(wait_time)
                         continue
 
@@ -1907,13 +2015,8 @@ class MixpanelAPIClient:
                             response_body = json.loads(body)
                         except json.JSONDecodeError:
                             response_body = body.decode()[:500] if body else None
-                        error_msg = _extract_api_error_message(
-                            response_body,
-                            status_code=response.status_code,
-                            default="Unknown error",
-                        )
                         raise QueryError(
-                            error_msg,
+                            _error_message(response_body, "Unknown error"),
                             status_code=response.status_code,
                             response_body=response_body,
                             request_method="GET",
@@ -1999,44 +2102,54 @@ class MixpanelAPIClient:
             Profile dictionaries with '$distinct_id' and '$properties' keys.
 
         Raises:
-            ValueError: If mutually exclusive parameters are provided together,
-                or if include_all_users is used without cohort_id.
+            ParamValidationError: If mutually exclusive parameters are
+                provided together (``AC2_DISTINCT_ID_CONFLICT`` /
+                ``AC3_BEHAVIORS_COHORT_CONFLICT``), include_all_users is
+                used without cohort_id
+                (``AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT``), behaviors is
+                not a list (``AC5_BEHAVIORS_NOT_LIST``), or as_of_timestamp
+                is in the future (``AC6_AS_OF_TIMESTAMP_FUTURE``).
             AuthenticationError: Invalid credentials.
             RateLimitError: Rate limit exceeded after max retries.
             ServerError: Server-side errors (5xx).
         """
         # Validate mutually exclusive parameters
         if distinct_id is not None and distinct_ids is not None:
-            raise ValueError(
+            raise ParamValidationError(
                 "distinct_id and distinct_ids are mutually exclusive. "
-                "Provide only one to fetch specific profiles."
+                "Provide only one to fetch specific profiles.",
+                code="AC2_DISTINCT_ID_CONFLICT",
             )
 
         if behaviors is not None and cohort_id is not None:
-            raise ValueError(
+            raise ParamValidationError(
                 "behaviors and cohort_id are mutually exclusive. "
-                "Use behaviors for behavioral filtering or cohort_id for cohort membership."
+                "Use behaviors for behavioral filtering or cohort_id for cohort membership.",
+                code="AC3_BEHAVIORS_COHORT_CONFLICT",
             )
 
         if include_all_users and cohort_id is None:
-            raise ValueError(
+            raise ParamValidationError(
                 "include_all_users requires cohort_id. "
-                "This parameter is only valid for cohort membership queries."
+                "This parameter is only valid for cohort membership queries.",
+                code="AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT",
             )
 
         # Validate behaviors type
         if behaviors is not None and not isinstance(behaviors, list):
-            raise ValueError(
-                "behaviors must be a list of behavioral filter dictionaries."
+            raise ParamValidationError(
+                "behaviors must be a list of behavioral filter dictionaries.",
+                code="AC5_BEHAVIORS_NOT_LIST",
             )
 
         # Validate as_of_timestamp is not in the future
         if as_of_timestamp is not None:
             current_time = int(time.time())
             if as_of_timestamp > current_time:
-                raise ValueError(
+                raise ParamValidationError(
                     "as_of_timestamp cannot be in the future. "
-                    "Provide a Unix timestamp in the past to query historical profile state."
+                    "Provide a Unix timestamp in the past to query historical profile state.",
+                    code="AC6_AS_OF_TIMESTAMP_FUTURE",
                 )
 
         # Handle empty distinct_ids list - return early without API call
@@ -3013,6 +3126,9 @@ class MixpanelAPIClient:
     def insights_query(
         self,
         body: dict[str, Any],
+        *,
+        workspace_id: int | None = None,
+        inject_workspace_id: bool = True,
     ) -> dict[str, Any]:
         """Execute an inline insights query via POST.
 
@@ -3023,6 +3139,13 @@ class MixpanelAPIClient:
         Args:
             body: Request body containing 'bookmark' (params dict),
                 'project_id' (int), and 'queryLimits' (dict).
+            workspace_id: Optional data view to run under. When set it is
+                sent as the ``workspace_id`` query parameter and wins over
+                the pinned session workspace.
+            inject_workspace_id: When ``True`` (default) and ``workspace_id``
+                is ``None``, the pinned session workspace, if any, is sent.
+                ``False`` sends no pin, so the query runs project-wide
+                unless ``workspace_id`` is set.
 
         Returns:
             Raw API response with computed_at, date_range, headers,
@@ -3037,8 +3160,10 @@ class MixpanelAPIClient:
         result: dict[str, Any] = self._request(
             "POST",
             url,
+            params=_explicit_workspace_params(workspace_id),
             data=body,
             inject_project_id=False,
+            inject_workspace_id=inject_workspace_id,
         )
         return result
 
@@ -3070,7 +3195,13 @@ class MixpanelAPIClient:
         result: dict[str, Any] = self._request("GET", url, params=params)
         return result
 
-    def arb_funnels_query(self, body: dict[str, Any]) -> dict[str, Any]:
+    def arb_funnels_query(
+        self,
+        body: dict[str, Any],
+        *,
+        workspace_id: int | None = None,
+        inject_workspace_id: bool = True,
+    ) -> dict[str, Any]:
         """Execute an inline flow/funnel query via the arb_funnels endpoint.
 
         Posts bookmark params directly to ``/arb_funnels`` with a
@@ -3083,6 +3214,13 @@ class MixpanelAPIClient:
             body: Request body containing ``bookmark`` (params dict),
                 ``project_id`` (int), and ``query_type`` (str — one of
                 ``"flows_sankey"`` or ``"flows_top_paths"``).
+            workspace_id: Optional data view to run under. When set it is
+                sent as the ``workspace_id`` query parameter and wins over
+                the pinned session workspace.
+            inject_workspace_id: When ``True`` (default) and ``workspace_id``
+                is ``None``, the pinned session workspace, if any, is sent.
+                ``False`` sends no pin, so the query runs project-wide
+                unless ``workspace_id`` is set.
 
         Returns:
             Raw API response with steps, flows, breakdowns, and
@@ -3097,8 +3235,10 @@ class MixpanelAPIClient:
         result: dict[str, Any] = self._request(
             "POST",
             url,
+            params=_explicit_workspace_params(workspace_id),
             data=body,
             inject_project_id=False,
+            inject_workspace_id=inject_workspace_id,
         )
         return result
 
@@ -4532,6 +4672,332 @@ class MixpanelAPIClient:
                 f"expected dict, got {type(result).__name__}",
             )
         return result
+
+    # -------------------------------------------------------------------------
+    # Report links (045-report-links): unsaved-report slug records
+    # -------------------------------------------------------------------------
+
+    def create_bookmark_url(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Store an unsaved report under a client-minted slug (045-report-links).
+
+        ``POST /api/app/projects/{pid}/bookmark-urls/``. The endpoint is always
+        project-scoped — it never goes under ``/workspaces/{wid}/`` even when a
+        workspace is pinned — and the server strips ``workspace_id`` from the
+        body, so this method drops that key before sending.
+
+        Args:
+            body: ``{"slug", "type", "params"}`` plus optional ``name``,
+                ``description``, and ``bookmark_id``. ``type`` is one of
+                ``insights``, ``funnels``, ``retention``, ``flows``.
+
+        Returns:
+            The stored record dict (``results`` unwrapped): ``slug``, ``type``,
+            ``params``, ``project_id``, ``created_at`` and friends.
+
+        Raises:
+            AuthenticationError: Invalid or expired credentials (401).
+            QueryError: Invalid payload or duplicate slug (400/404/422).
+            RateLimitError: Rate limit exceeded after max retries (429).
+            ServerError: Server-side errors (5xx).
+            MixpanelHeadlessError: The response was not a dict.
+
+        Example:
+            ```python
+            with MixpanelAPIClient(session=session) as client:
+                record = client.create_bookmark_url({
+                    "slug": "EBrV5bW2u9Mw",
+                    "type": "insights",
+                    "params": params,
+                })
+            ```
+        """
+        payload = {k: v for k, v in body.items() if k != "workspace_id"}
+        result = self.app_request(
+            "POST", f"/projects/{self.project_id}/bookmark-urls/", json_body=payload
+        )
+        if not isinstance(result, dict):
+            raise MixpanelHeadlessError(
+                f"Unexpected response from create_bookmark_url: "
+                f"expected dict, got {type(result).__name__}",
+            )
+        return result
+
+    def get_bookmark_url(self, slug: str) -> dict[str, Any]:
+        """Fetch the unsaved-report record stored under a slug (045-report-links).
+
+        ``GET /api/app/projects/{pid}/bookmark-urls/{slug}/``. Always
+        project-scoped, even when a workspace is pinned. A slug is readable
+        only in the project and region that created it, so a 404 is mapped to
+        :class:`ReportLinkNotFoundError` with that explanation.
+
+        Args:
+            slug: The 12-character slug.
+
+        Returns:
+            The record dict (``results`` unwrapped): ``slug``, ``type``,
+            ``params``, optional ``name``, ``description``, ``overrides``,
+            ``bookmark`` / ``bookmark_id``, ``project_id``, ``created_at``.
+
+        Raises:
+            ReportLinkNotFoundError: ``REPORT_LINK_SLUG_NOT_FOUND`` on a 404.
+            AuthenticationError: Invalid or expired credentials (401).
+            QueryError: Other 4xx responses (400/403/422).
+            RateLimitError: Rate limit exceeded after max retries (429).
+            ServerError: Server-side errors (5xx).
+            MixpanelHeadlessError: The response was not a dict.
+
+        Example:
+            ```python
+            with MixpanelAPIClient(session=session) as client:
+                record = client.get_bookmark_url("EBrV5bW2u9Mw")
+                record["type"], record["params"]
+            ```
+        """
+        try:
+            result = self.app_request(
+                "GET", f"/projects/{self.project_id}/bookmark-urls/{slug}/"
+            )
+        except QueryError as exc:
+            if exc.status_code == 404:
+                project_id = int(self.project_id)
+                raise ReportLinkNotFoundError(
+                    f"No unsaved report found for slug {slug} in project "
+                    f"{project_id} ({self.region}). A slug is only readable in "
+                    f"the project and region that created it.",
+                    code="REPORT_LINK_SLUG_NOT_FOUND",
+                    details={
+                        "kind": "slug",
+                        "slug": slug,
+                        "project_id": project_id,
+                        "region": self.region,
+                        "hint": (
+                            "Switch to the project and region that created the "
+                            "link (ws.use(project=...); CLI: mp --project ... "
+                            "or mp --account ...) and retry."
+                        ),
+                    },
+                ) from exc
+            raise
+        if not isinstance(result, dict):
+            raise MixpanelHeadlessError(
+                f"Unexpected response from get_bookmark_url: "
+                f"expected dict, got {type(result).__name__}",
+            )
+        return result
+
+    @staticmethod
+    def _short_link_target(
+        request_url: str, raw_target: str, *, code: str, status: int
+    ) -> str:
+        """Join a shortlink target to the request URL and reject the login page.
+
+        Args:
+            request_url: The ``https://{host}/s/{code}`` URL that was fetched.
+            raw_target: The ``Location`` header or the scripted ``href``,
+                absolute or relative.
+            code: The shortlink code, for the message.
+            status: The HTTP status, for the error context.
+
+        Returns:
+            The absolute target URL.
+
+        Raises:
+            AuthenticationError: The target path is ``/login`` or under it.
+        """
+        target = urljoin(request_url, raw_target)
+        path = urlsplit(target).path
+        if path == "/login" or path.startswith("/login/"):
+            raise AuthenticationError(
+                f"Shortlink /s/{code} requires authentication; the server "
+                f"redirected to the login page.",
+                status_code=status,
+                request_method="GET",
+                request_url=request_url,
+            )
+        return target
+
+    def _get_short_link(self, url: str) -> httpx.Response:
+        """Send the shortlink GET, with the same 429 backoff as every API call.
+
+        Args:
+            url: The ``https://{host}/s/{code}`` URL.
+
+        Returns:
+            The first response whose status is not 429.
+
+        Raises:
+            RateLimitError: 429 on every attempt.
+            MixpanelHeadlessError: ``HTTP_ERROR`` on a transport failure.
+        """
+        headers = self._request_headers({"Authorization": self._get_auth_header()})
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._ensure_client().get(
+                    url,
+                    headers=headers,
+                    follow_redirects=False,
+                    timeout=DEFAULT_APP_TIMEOUT_S,
+                )
+            except httpx.HTTPError as e:
+                raise MixpanelHeadlessError(
+                    f"HTTP error: {e}",
+                    code="HTTP_ERROR",
+                    details={
+                        "error": str(e),
+                        "request_method": "GET",
+                        "request_url": url,
+                    },
+                ) from e
+            if response.status_code != 429:
+                return response
+            retry_after = self._parse_retry_after(response)
+            if attempt >= self._max_retries:
+                raise RateLimitError(
+                    retry_after=retry_after,
+                    status_code=response.status_code,
+                    request_method="GET",
+                    request_url=url,
+                    project_id=self.project_id,
+                )
+            wait_time = self._retry_wait_seconds(retry_after, attempt)
+            logger.warning(
+                "Rate limited, retrying in %.1f seconds (attempt %d/%d)",
+                wait_time,
+                attempt + 1,
+                self._max_retries,
+            )
+            time.sleep(wait_time)
+        raise RateLimitError(  # pragma: no cover - loop always returns or raises
+            request_method="GET", request_url=url, project_id=self.project_id
+        )
+
+    def resolve_short_link(self, code: str) -> str:
+        """Expand a ``https://{host}/s/{code}`` shortlink to its target URL.
+
+        Sends one authenticated GET with ``follow_redirects=False`` and reads
+        the target from the ``Location`` header, or from the
+        ``window.location.href`` script the server returns for very long
+        targets. A relative target is joined to the request URL in both
+        cases. It bypasses :meth:`_execute_with_retry` and
+        :meth:`_handle_response` because both treat a 3xx as an error, but it
+        keeps the same 429 backoff. The Authorization header is never logged.
+
+        Args:
+            code: The shortlink code after ``/s/``.
+
+        Returns:
+            The absolute target URL. It is not parsed or validated here.
+
+        Raises:
+            AuthenticationError: 401, or a redirect (header or script) to
+                ``/login``.
+            ReportLinkNotFoundError: ``SHORT_LINK_NOT_FOUND`` on a 404.
+            QueryError: 403 (permission denied).
+            RateLimitError: 429 on every retry attempt.
+            ServerError: 5xx.
+            ShortLinkResolutionError: ``SHORT_LINK_NO_LOCATION`` for a 3xx
+                without ``Location``; ``SHORT_LINK_UNEXPECTED_RESPONSE`` for a
+                200 whose body has no decodable, non-empty redirect script, or
+                for any other status.
+            MixpanelHeadlessError: ``HTTP_ERROR`` on a transport failure.
+
+        Example:
+            ```python
+            with MixpanelAPIClient(session=session) as client:
+                target = client.resolve_short_link("AbC123")
+            # "https://mixpanel.com/project/3/view/75/app/insights#EBrV5bW2u9Mw"
+            ```
+        """
+        host = web_host(self.region)
+        url = f"https://{host}/s/{code}"
+        logger.debug("resolving shortlink /s/%s on %s", code, host)
+        response = self._get_short_link(url)
+
+        status = response.status_code
+        base_details: dict[str, Any] = {
+            "kind": "short_link",
+            "short_code": code,
+            "host": host,
+            "region": self.region,
+        }
+
+        if status in _SHORT_LINK_REDIRECT_STATUSES:
+            location: str = response.headers.get("Location", "")
+            if not location:
+                raise ShortLinkResolutionError(
+                    f"Shortlink /s/{code} returned HTTP {status} without a "
+                    f"Location header.",
+                    code="SHORT_LINK_NO_LOCATION",
+                    details={
+                        **base_details,
+                        "status": status,
+                        "hint": _SHORT_LINK_HINT,
+                    },
+                )
+            return self._short_link_target(url, location, code=code, status=status)
+
+        if status == 200:
+            match = _SHORT_LINK_HREF_RE.search(response.text)
+            decoded: object = None
+            if match is not None:
+                try:
+                    decoded = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    decoded = None
+            if isinstance(decoded, str) and decoded:
+                return self._short_link_target(url, decoded, code=code, status=status)
+            raise ShortLinkResolutionError(
+                f"Shortlink /s/{code} returned HTTP {status} with a body "
+                f"mixpanel-headless does not recognize.",
+                code="SHORT_LINK_UNEXPECTED_RESPONSE",
+                details={**base_details, "status": status, "hint": _SHORT_LINK_HINT},
+            )
+
+        if status == 401:
+            raise AuthenticationError(
+                "Invalid credentials. Check username, secret, and project_id.",
+                status_code=status,
+                request_method="GET",
+                request_url=url,
+            )
+        if status == 403:
+            body: str | dict[str, Any] | None
+            try:
+                body = response.json()
+            except json.JSONDecodeError:
+                body = response.text[:500] if response.text else None
+            raise QueryError(
+                _error_message(body, "Permission denied"),
+                status_code=status,
+                response_body=body,
+                request_method="GET",
+                request_url=url,
+            )
+        if status == 404:
+            raise ReportLinkNotFoundError(
+                f"Shortlink /s/{code} does not exist on {host}.",
+                code="SHORT_LINK_NOT_FOUND",
+                details={
+                    **base_details,
+                    "hint": (
+                        "Check the shortlink for typos, or open it in a browser "
+                        "and copy the full URL."
+                    ),
+                },
+            )
+        if status >= 500:
+            raise ServerError(
+                f"Server error {status} while resolving shortlink /s/{code}",
+                status_code=status,
+                request_method="GET",
+                request_url=url,
+            )
+        raise ShortLinkResolutionError(
+            f"Shortlink /s/{code} returned HTTP {status} with a body "
+            f"mixpanel-headless does not recognize.",
+            code="SHORT_LINK_UNEXPECTED_RESPONSE",
+            details={**base_details, "status": status, "hint": _SHORT_LINK_HINT},
+        )
 
     def update_bookmark(self, bookmark_id: int, body: dict[str, Any]) -> dict[str, Any]:
         """Update an existing bookmark (partial update via PATCH).
@@ -6809,6 +7275,52 @@ class MixpanelAPIClient:
             include_zero_counts=include_zero_counts,
         )
 
+    def list_per_event_properties(self) -> list[dict[str, Any]]:
+        """List every event with the properties observed on it (query API).
+
+        Calls ``GET {query}/data_definitions/events`` with
+        ``fetch_per_event_properties=true`` — the internal query-API surface the
+        Mixpanel Lexicon UI itself uses — and unwraps the ``results`` envelope.
+        This is the relationship source for the schema graph: the App API's
+        ``includeEvents=true`` bulk call computes the same event<->property join
+        behind a ~120s gateway deadline it cannot meet on large projects, while
+        the query-API route permits longer runs, so this request is sent with
+        the export timeout. A pinned workspace is injected as ``workspace_id``
+        and the server applies its event-name filters.
+
+        Returns:
+            List of event dicts; each carries a ``properties`` list of property
+            definition dicts (at minimum ``{"name": ...}``-shaped).
+
+        Raises:
+            AuthenticationError: Invalid credentials (401).
+            QueryError: API error (400/404).
+            ServerError: Server-side errors (5xx).
+            MixpanelHeadlessError: Network/connection errors, or a non-list
+                ``results`` payload.
+
+        Example:
+            ```python
+            with MixpanelAPIClient(session) as client:
+                rows = client.list_per_event_properties()
+                rows[0]["properties"][0]["name"]  # "amount"
+            ```
+        """
+        url = self._build_url("query", "/data_definitions/events")
+        result = self._request(
+            "GET",
+            url,
+            params={"fetch_per_event_properties": "true"},
+            timeout=self._export_timeout,
+        )
+        rows = result.get("results") if isinstance(result, dict) else result
+        if not isinstance(rows, list):
+            raise MixpanelHeadlessError(
+                f"Unexpected response from per-event properties: "
+                f"expected list, got {type(rows).__name__}",
+            )
+        return rows
+
     def update_property_definition(
         self, name: str, body: dict[str, Any]
     ) -> dict[str, Any]:
@@ -7642,10 +8154,10 @@ class MixpanelAPIClient:
         if self._transport is not None:
             # Test mode: use the mock transport
             upload_client = httpx.Client(
-                transport=self._transport, timeout=self._timeout
+                transport=self._transport, timeout=self._default_timeout(url)
             )
         else:
-            upload_client = httpx.Client(timeout=self._timeout)
+            upload_client = httpx.Client(timeout=self._default_timeout(url))
         try:
             response = upload_client.put(
                 url,
@@ -7709,7 +8221,7 @@ class MixpanelAPIClient:
             url,
             data=form_data,
             headers=self._request_headers({"Authorization": auth_header}),
-            timeout=self._timeout,
+            timeout=self._default_timeout(url),
         )
         if response.status_code >= 400:
             self._handle_response(
@@ -7912,7 +8424,7 @@ class MixpanelAPIClient:
             url,
             params=params,
             headers=self._request_headers({"Authorization": auth_header}),
-            timeout=self._timeout,
+            timeout=self._default_timeout(url),
         )
         if response.status_code >= 400:
             # Delegate error handling

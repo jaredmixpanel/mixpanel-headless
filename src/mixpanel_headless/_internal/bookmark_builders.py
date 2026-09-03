@@ -14,6 +14,7 @@ from datetime import date
 from typing import Any, Literal, cast
 
 from mixpanel_headless._literal_types import QueryTimeUnit
+from mixpanel_headless.exceptions import ParamTypeError, ParamValidationError
 from mixpanel_headless.types import (
     CohortBreakdown,
     CustomPropertyRef,
@@ -266,14 +267,17 @@ def build_group_section(
         data_group_id: Optional data group ID for group-level analytics.
             Threads into ``dataGroupId`` fields within group entries
             that support it (custom property refs, inline custom
-            properties, cohort breakdowns). Default: ``None``.
+            properties, cohort breakdowns), coerced to ``str`` at
+            emission (the bookmark contract types clause-level
+            ``dataGroupId`` as ``string | null``). Default: ``None``.
 
     Returns:
         List of group entry dicts (may be empty).
 
     Raises:
-        TypeError: If any element is not ``str``, ``GroupBy``,
-            ``CohortBreakdown``, or ``FrequencyBreakdown``.
+        ParamTypeError: If any element is not ``str``, ``GroupBy``,
+            ``CohortBreakdown``, or ``FrequencyBreakdown``
+            (``BB1_GROUP_BY_ELEMENT_TYPE``).
 
     Example:
         ```python
@@ -284,6 +288,10 @@ def build_group_section(
     """
     if group_by is None:
         return []
+
+    # Contract: GroupClause.dataGroupId is string | null — coerce the
+    # int-typed parameter once at emission.
+    dgid = str(data_group_id) if data_group_id is not None else None
 
     groups = list(group_by) if isinstance(group_by, (list, tuple)) else [group_by]
     group_section: list[dict[str, Any]] = []
@@ -312,7 +320,7 @@ def build_group_section(
                     "resourceType": "events",
                     "profileType": None,
                     "search": "",
-                    "dataGroupId": data_group_id,
+                    "dataGroupId": dgid,
                     "dataset": "$mixpanel",
                     "propertyType": g.property_type,
                     "typeCast": None,
@@ -339,7 +347,7 @@ def build_group_section(
                     "resourceType": prop.resource_type,
                     "profileType": None,
                     "search": "",
-                    "dataGroupId": data_group_id,
+                    "dataGroupId": dgid,
                     "dataset": "$mixpanel",
                     "propertyType": effective_type,
                     "typeCast": None,
@@ -392,9 +400,10 @@ def build_group_section(
                 _build_cohort_group_entry(g, data_group_id=data_group_id)
             )
         else:
-            raise TypeError(
+            raise ParamTypeError(
                 f"group_by elements must be str, GroupBy, CohortBreakdown, "
-                f"or FrequencyBreakdown, got {type(g).__name__}: {g!r}"
+                f"or FrequencyBreakdown, got {type(g).__name__}: {g!r}",
+                code="BB1_GROUP_BY_ELEMENT_TYPE",
             )
 
     return group_section
@@ -415,8 +424,9 @@ def _build_cohort_group_entry(
         cb: CohortBreakdown specification.
         data_group_id: Optional data group ID for group-level analytics.
             Threads into ``data_group_id`` in cohort entries and
-            ``dataGroupId`` in the top-level group entry.
-            Default: ``None``.
+            ``dataGroupId`` in the top-level group entry, coerced to
+            ``str`` (the bookmark contract types both slots
+            ``string | null``). Default: ``None``.
 
     Returns:
         Group entry dict with ``cohorts`` array.
@@ -428,6 +438,9 @@ def _build_cohort_group_entry(
         ```
     """
     name = cb.name or ""
+    # Contract: GroupByCohort.data_group_id and GroupClause.dataGroupId are
+    # both string | null — coerce the int-typed parameter at emission.
+    dgid = str(data_group_id) if data_group_id is not None else None
 
     # Build cohort entries — saved vs inline use different API schemas:
     # Schema 1 (saved): allows groups, count, description, etc.
@@ -435,7 +448,7 @@ def _build_cohort_group_entry(
     base_cohort: dict[str, Any] = {
         "name": name,
         "negated": False,
-        "data_group_id": data_group_id,
+        "data_group_id": dgid,
     }
     if isinstance(cb.cohort, int):
         base_cohort["id"] = cb.cohort
@@ -455,7 +468,7 @@ def _build_cohort_group_entry(
         "resourceType": "events",
         "profileType": None,
         "search": "",
-        "dataGroupId": data_group_id,
+        "dataGroupId": dgid,
         "propertyType": None,
         "typeCast": None,
         "cohorts": cohorts,
@@ -595,6 +608,12 @@ def build_flow_property_filter(
         Dict with ``operator`` and ``children`` keys suitable for
         the ``filter_by_event`` bookmark key.
 
+    Raises:
+        ParamValidationError: If ``filters`` is empty
+            (``BB2_FLOW_PROPERTY_FILTER_EMPTY``).
+        ParamTypeError: If a filter's property is not a plain string
+            (``BB3_FLOW_PROPERTY_FILTER_TYPE``).
+
     Example:
         ```python
         fbe = build_flow_property_filter([Filter.equals("country", "US")])
@@ -606,9 +625,10 @@ def build_flow_property_filter(
         ```
     """
     if not filters:
-        raise ValueError(
+        raise ParamValidationError(
             "build_flow_property_filter requires at least one filter; "
-            "caller should check before calling"
+            "caller should check before calling",
+            code="BB2_FLOW_PROPERTY_FILTER_EMPTY",
         )
     children: list[dict[str, Any]] = []
     for f in filters:
@@ -618,10 +638,11 @@ def build_flow_property_filter(
         if isinstance(prop, str):
             entry["propertyName"] = prop
         else:
-            raise TypeError(
+            raise ParamTypeError(
                 f"build_flow_property_filter only supports string property "
                 f"filters; got {type(prop).__name__} — custom property refs "
-                f"are not supported in flow filters"
+                f"are not supported in flow filters",
+                code="BB3_FLOW_PROPERTY_FILTER_TYPE",
             )
         # Remove the "value" key since flow filters use propertyName instead
         entry.pop("value", None)
@@ -655,8 +676,13 @@ def build_flow_cohort_filter(
         key, or ``None`` if ``where`` is empty.
 
     Raises:
-        ValueError: If any filter is not a cohort filter
-            (``_property != "$cohorts"``).
+        ParamValidationError: If any filter is not a cohort filter
+            (``_property != "$cohorts"``; ``BB4_FLOW_COHORT_FILTER_TYPE``),
+            if more than one cohort filter is provided
+            (``BB5_FLOW_MULTIPLE_COHORT_FILTERS``), or if the cohort
+            filter's internal ``_value`` structure is malformed
+            (``BB6_COHORT_VALUE_NOT_LIST`` / ``BB7_COHORT_VALUE_NOT_DICT``
+            / ``BB8_COHORT_KEY_MISSING``).
 
     Example:
         ```python
@@ -670,40 +696,45 @@ def build_flow_cohort_filter(
 
     for f in filters:
         if f._property != "$cohorts":
-            raise ValueError(
+            raise ParamValidationError(
                 "build_flow_cohort_filter only accepts cohort filters "
                 "(Filter.in_cohort/not_in_cohort); property filters should "
-                "use build_flow_property_filter instead"
+                "use build_flow_property_filter instead",
+                code="BB4_FLOW_COHORT_FILTER_TYPE",
             )
 
     if len(filters) > 1:
-        raise ValueError(
+        raise ParamValidationError(
             f"query_flow supports a single cohort filter, but {len(filters)} "
-            "were provided. Pass only one Filter.in_cohort/not_in_cohort."
+            "were provided. Pass only one Filter.in_cohort/not_in_cohort.",
+            code="BB5_FLOW_MULTIPLE_COHORT_FILTERS",
         )
 
     f = filters[0]
     # Extract from the _value structure: [{"cohort": {...}}]
     cohort_value = f._value
     if not isinstance(cohort_value, list) or len(cohort_value) == 0:
-        raise ValueError(
+        raise ParamValidationError(
             "Internal error: cohort filter _value must be a non-empty list; "
             f"got {type(cohort_value).__name__}. This indicates a bug in "
-            "Filter._build_cohort_filter."
+            "Filter._build_cohort_filter.",
+            code="BB6_COHORT_VALUE_NOT_LIST",
         )
     first_item = cohort_value[0]
     if not isinstance(first_item, dict):
-        raise ValueError(
+        raise ParamValidationError(
             "Internal error: cohort filter _value[0] is not a dict; "
             f"got {type(first_item).__name__}. This indicates a bug in "
-            "Filter._build_cohort_filter."
+            "Filter._build_cohort_filter.",
+            code="BB7_COHORT_VALUE_NOT_DICT",
         )
     cohort_data = first_item.get("cohort")
     if not isinstance(cohort_data, dict):
-        raise ValueError(
+        raise ParamValidationError(
             "Internal error: cohort filter _value[0] is missing 'cohort' key; "
             f"got keys {list(first_item.keys())}. This indicates a bug in "
-            "Filter._build_cohort_filter."
+            "Filter._build_cohort_filter.",
+            code="BB8_COHORT_KEY_MISSING",
         )
     result: dict[str, Any] = {
         "name": cohort_data.get("name", ""),
@@ -730,7 +761,9 @@ def build_frequency_group_entry(
 
     Args:
         fb: FrequencyBreakdown specification.
-        data_group_id: Optional data group ID for group-level analytics.
+        data_group_id: Optional data group ID for group-level analytics,
+            coerced to ``str`` at emission (the bookmark contract types
+            ``dataGroupId`` as ``string | null``).
 
     Returns:
         Group entry dict matching the Mixpanel bookmark API schema:
@@ -757,6 +790,9 @@ def build_frequency_group_entry(
         ```
     """
     display_label = fb.label if fb.label is not None else f"{fb.event} Frequency"
+    # Contract: GroupClause.dataGroupId is string | null — coerce the
+    # int-typed parameter at emission.
+    dgid = str(data_group_id) if data_group_id is not None else None
     entry: dict[str, Any] = {
         "dataset": "$mixpanel",
         "behavior": {
@@ -770,7 +806,7 @@ def build_frequency_group_entry(
         "value": display_label,
         "resourceType": "people",
         "propertyType": "number",
-        "dataGroupId": data_group_id,
+        "dataGroupId": dgid,
         "customBucket": {
             "bucketSize": fb.bucket_size,
             "min": fb.bucket_min,
@@ -784,16 +820,30 @@ def build_frequency_group_entry(
 def build_frequency_filter_entry(ff: FrequencyFilter) -> dict[str, Any]:
     """Build a single frequency filter entry for sections.filter[].
 
-    Produces the frequency-specific filter dict with ``behaviorType``
-    set to ``"$frequency"`` and ``resourceType`` set to ``"people"``.
+    Produces the platform-native frequency filter clause: top-level
+    ``filterType`` / ``filterOperator`` / ``filterValue`` with the
+    ``"$frequency"`` marker nested under ``behavior.behaviorType``,
+    matching the analytics bookmark contract (fix for the
+    ``customProperty``-nested shape the query engine rejected with
+    HTTP 500 — see
+    ``context/phase1/bug-reports/mixpanel-headless-frequency-filter-clause-shape.md``).
 
     Args:
         ff: FrequencyFilter specification.
 
     Returns:
-        Filter entry dict with ``customProperty.behavior`` sub-dict
-        containing the frequency event, operator, and threshold.
-        Optionally includes ``dateRange`` and ``eventFilters``.
+        Filter clause dict with ``dataset``, ``resourceType``
+        (``"people"``), ``profileType``, ``search``, ``dataGroupId``,
+        a ``behavior`` sub-dict (``aggregationOperator``,
+        ``behaviorType``, ``dateRange``, ``event`` as a
+        ``{label, value}`` object, ``filters``, ``filtersOperator``),
+        top-level ``filterType`` / ``defaultType`` (``"number"``),
+        ``filterOperator``, ``filterValue``, ``propertyObjectKey``,
+        and ``value`` (display label, defaulting to
+        ``"<event> Frequency"``). Event filters render into
+        ``behavior.filters``; a lookback window renders into
+        ``behavior.dateRange`` as an ``"in the last"`` range with a
+        ``window`` offset.
 
     Example:
         ```python
@@ -805,33 +855,44 @@ def build_frequency_filter_entry(ff: FrequencyFilter) -> dict[str, Any]:
         entry = build_frequency_filter_entry(
             FrequencyFilter("Login", value=5)
         )
-        # {"resourceType": "people", "behaviorType": "$frequency",
-        #  "customProperty": {"behavior": {"event": "Login", ...}}}
+        # {"resourceType": "people", "filterType": "number",
+        #  "filterOperator": "is at least", "filterValue": 5,
+        #  "behavior": {"behaviorType": "$frequency",
+        #               "event": {"label": "Login", "value": "Login"}, ...},
+        #  "value": "Login Frequency", ...}
         ```
     """
     behavior: dict[str, Any] = {
-        "event": ff.event,
-        "aggregation": "total",
-        "filterOperator": ff.operator,
-        "filterValue": ff.value,
+        "aggregationOperator": "total",
+        "behaviorType": "$frequency",
+        "dateRange": None,
+        "event": {"label": ff.event, "value": ff.event},
+        "filters": [],
+        "filtersOperator": "and",
     }
     if ff.date_range_value is not None and ff.date_range_unit is not None:
         behavior["dateRange"] = {
-            "value": ff.date_range_value,
+            "type": "in the last",
             "unit": ff.date_range_unit,
+            "window": {"unit": ff.date_range_unit, "value": ff.date_range_value},
         }
     if ff.event_filters is not None:
-        behavior["eventFilters"] = [build_filter_entry(f) for f in ff.event_filters]
-    entry: dict[str, Any] = {
+        behavior["filters"] = [build_filter_entry(f) for f in ff.event_filters]
+    display_label = ff.label if ff.label is not None else f"{ff.event} Frequency"
+    return {
+        "dataset": "$mixpanel",
         "resourceType": "people",
-        "behaviorType": "$frequency",
-        "customProperty": {
-            "behavior": behavior,
-        },
+        "profileType": None,
+        "search": "",
+        "dataGroupId": None,
+        "behavior": behavior,
+        "filterType": "number",
+        "defaultType": "number",
+        "filterOperator": ff.operator,
+        "filterValue": ff.value,
+        "propertyObjectKey": None,
+        "value": display_label,
     }
-    if ff.label is not None:
-        entry["label"] = ff.label
-    return entry
 
 
 def build_time_comparison(tc: TimeComparison) -> dict[str, str]:

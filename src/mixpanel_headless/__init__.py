@@ -67,17 +67,26 @@ from mixpanel_headless.exceptions import (
     InvalidArgumentError,
     MixpanelHeadlessError,
     OAuthError,
+    ParamTypeError,
+    ParamValidationError,
     ProjectNotFoundError,
     QueryError,
     RateLimitError,
     RegionProbeError,
     RegionProbeNetworkError,
     ReplayNotFoundError,
+    ReportLinkError,
+    ReportLinkNotFoundError,
+    ReportLinkParseError,
+    ReportLinkScopeMismatchError,
+    ResponseValidationError,
     ServerError,
     SessionReplayAccessError,
     SessionReplayError,
+    ShortLinkResolutionError,
     SignedURLExpiredError,
     UnsupportedReplayFormatError,
+    UnsupportedReportLinkError,
     ValidationError,
     WorkspaceScopeError,
 )
@@ -121,6 +130,7 @@ from mixpanel_headless.types import (
     BookmarkInfo,
     BookmarkMetadata,
     BookmarkType,
+    BookmarkUrl,
     BulkAnomalyEntry,
     BulkCreateSchemasParams,
     BulkCreateSchemasResponse,
@@ -243,6 +253,10 @@ from mixpanel_headless.types import (
     ReplayBundle,
     ReplayEvent,
     ReplaySummary,
+    ReportLink,
+    ReportLinkQueryResult,
+    ReportLinkType,
+    ResolvedReport,
     RetentionCohortData,
     RetentionEvent,
     RetentionQueryResult,
@@ -292,7 +306,7 @@ from mixpanel_headless.types import (
 )
 from mixpanel_headless.workspace import Workspace
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 __all__ = [
     # Core
@@ -373,6 +387,9 @@ __all__ = [
     "MixpanelHeadlessError",
     "BookmarkValidationError",
     "ValidationError",
+    "ParamValidationError",
+    "ParamTypeError",
+    "ResponseValidationError",
     "APIError",
     "ConfigError",
     "InvalidArgumentError",
@@ -407,6 +424,18 @@ __all__ = [
     "default_label_fn",
     "selector_label_fn",
     "url_normalizer",
+    # Report links (AIE-561/562)
+    "ReportLinkType",
+    "BookmarkUrl",
+    "ReportLink",
+    "ResolvedReport",
+    "ReportLinkQueryResult",
+    "ReportLinkError",
+    "ReportLinkParseError",
+    "UnsupportedReportLinkError",
+    "ReportLinkNotFoundError",
+    "ReportLinkScopeMismatchError",
+    "ShortLinkResolutionError",
     # Result types
     "SegmentationResult",
     "FunnelResult",

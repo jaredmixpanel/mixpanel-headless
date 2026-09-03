@@ -43,6 +43,7 @@ dependencies = [
 # is additionally split into its own ``[jq]`` extra for the ``--jq`` filter.
 cli = [
     "typer>=0.12",
+    "click>=8.0",
     "rich>=13.0",
     "jq>=1.9.0",
 ]
@@ -61,8 +62,12 @@ dev = [
     # The test suite exercises the CLI, so the dev env always needs the CLI
     # extra even though base installs (and the slim wheel) omit it.
     "typer>=0.12",
+    "click>=8.0",
     "rich>=13.0",
     "jq>=1.9.0",
+    "freezegun>=1.5",
+    "jsonschema>=4.21",
+    "types-jsonschema>=4.21",
 ]
 docs = [
     "mkdocs>=1.5",

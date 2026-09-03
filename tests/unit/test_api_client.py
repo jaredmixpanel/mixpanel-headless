@@ -6,6 +6,7 @@ Tests use httpx.MockTransport for deterministic HTTP mocking.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator
 from datetime import date, timedelta
 from typing import Any
@@ -16,7 +17,11 @@ from httpx._types import SyncByteStream
 from pydantic import SecretStr
 
 from mixpanel_headless._internal.api_client import (
+    APP_API_SERVER_DEADLINE_S,
+    DEFAULT_APP_TIMEOUT_S,
+    DEFAULT_QUERY_TIMEOUT_S,
     ENDPOINTS,
+    QUERY_API_SERVER_DEADLINE_S,
     MixpanelAPIClient,
     _iter_jsonl_lines,
 )
@@ -24,6 +29,8 @@ from mixpanel_headless._internal.auth.account import ServiceAccount
 from mixpanel_headless._internal.auth.session import Session
 from mixpanel_headless.exceptions import (
     AuthenticationError,
+    MixpanelHeadlessError,
+    ParamValidationError,
     QueryError,
     RateLimitError,
 )
@@ -110,6 +117,94 @@ class TestEndpoints:
         assert ENDPOINTS["us"]["engage"] == "https://mixpanel.com/api/query/engage"
         assert ENDPOINTS["eu"]["engage"] == "https://eu.mixpanel.com/api/query/engage"
         assert ENDPOINTS["in"]["engage"] == "https://in.mixpanel.com/api/query/engage"
+
+
+class TestServerDeadlineAccommodation:
+    """Route-aware default timeouts sized to outlast the server's deadline.
+
+    Mixpanel's edge enforces read deadlines per route family (nginx
+    ``proxy_read_timeout``): ~120s for App API routes and 488s for query
+    routes. The client-side defaults must exceed those deadlines so a slow
+    request is always resolved by the server's own answer (success or 5xx),
+    never pre-empted by a client read timeout. An explicit ``timeout``
+    (constructor or per-call) still wins.
+    """
+
+    @staticmethod
+    def _capture_client(
+        test_credentials: Session,
+        seen: dict[str, Any],
+        **kwargs: Any,
+    ) -> MixpanelAPIClient:
+        """Build a client whose transport records the per-request timeout.
+
+        Args:
+            test_credentials: Session fixture for the client.
+            seen: Dict the handler writes the request timeout into.
+            **kwargs: Extra MixpanelAPIClient constructor arguments.
+
+        Returns:
+            A client wired to the capturing MockTransport.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["timeout"] = request.extensions.get("timeout")
+            return httpx.Response(200, json={"results": []})
+
+        return MixpanelAPIClient(
+            session=test_credentials,
+            _transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+
+    def test_default_constants_outlast_server_deadlines(self) -> None:
+        """Each route default strictly exceeds the matching server deadline."""
+        assert DEFAULT_APP_TIMEOUT_S > APP_API_SERVER_DEADLINE_S
+        assert DEFAULT_QUERY_TIMEOUT_S > QUERY_API_SERVER_DEADLINE_S
+
+    def test_default_export_timeout_outlasts_query_deadline(
+        self, test_credentials: Session
+    ) -> None:
+        """The export tier (used by long gathers) also outlasts 488s."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._export_timeout > QUERY_API_SERVER_DEADLINE_S
+        client.close()
+
+    def test_app_request_outlasts_app_deadline(self, test_credentials: Session) -> None:
+        """App API requests default to the app-route read timeout."""
+        seen: dict[str, Any] = {}
+        client = self._capture_client(test_credentials, seen)
+        client.app_request("GET", "/projects/12345/dashboards")
+        assert seen["timeout"]["read"] == DEFAULT_APP_TIMEOUT_S
+
+    def test_query_request_outlasts_query_deadline(
+        self, test_credentials: Session
+    ) -> None:
+        """Query-host requests default to the query-route read timeout."""
+        seen: dict[str, Any] = {}
+        client = self._capture_client(test_credentials, seen)
+        client.request("GET", f"{ENDPOINTS['us']['query']}/segmentation")
+        assert seen["timeout"]["read"] == DEFAULT_QUERY_TIMEOUT_S
+
+    def test_explicit_constructor_timeout_wins_everywhere(
+        self, test_credentials: Session
+    ) -> None:
+        """A constructor timeout overrides the route-aware defaults."""
+        seen: dict[str, Any] = {}
+        client = self._capture_client(test_credentials, seen, timeout=42.0)
+        client.app_request("GET", "/projects/12345/dashboards")
+        assert seen["timeout"]["read"] == 42.0
+        client.request("GET", f"{ENDPOINTS['us']['query']}/segmentation")
+        assert seen["timeout"]["read"] == 42.0
+
+    def test_per_call_timeout_wins_over_defaults(
+        self, test_credentials: Session
+    ) -> None:
+        """A per-call timeout overrides both defaults and the constructor."""
+        seen: dict[str, Any] = {}
+        client = self._capture_client(test_credentials, seen, timeout=42.0)
+        client.request("GET", f"{ENDPOINTS['us']['query']}/segmentation", timeout=7.0)
+        assert seen["timeout"]["read"] == 7.0
 
 
 class TestClientInit:
@@ -3458,3 +3553,799 @@ class TestActivityFeed:
                     ["user_1"],
                     search_properties=[{"value": "$city", "resourceType": "event"}],
                 )
+
+
+# =============================================================================
+# Retry-After hardening (hostile / invalid header values)
+# =============================================================================
+
+
+@pytest.fixture
+def recorded_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture every ``time.sleep`` call made by the api_client module.
+
+    The retry paths sleep for whatever the server asks; the tests need to see
+    the exact duration without actually waiting for it.
+
+    Args:
+        monkeypatch: pytest monkeypatch fixture (restores ``time.sleep``).
+
+    Returns:
+        A list that accumulates the seconds passed to each ``time.sleep``
+        call, in order.
+    """
+    calls: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        """Record a sleep instead of performing it.
+
+        Args:
+            seconds: Requested sleep duration.
+        """
+        calls.append(seconds)
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    return calls
+
+
+class TestParseRetryAfter:
+    """Test ``_parse_retry_after`` header validation."""
+
+    def test_parses_positive_integer(self, test_credentials: Session) -> None:
+        """A well-formed integer header is returned as an int."""
+        client = MixpanelAPIClient(session=test_credentials)
+        response = httpx.Response(429, headers={"Retry-After": "7"})
+        assert client._parse_retry_after(response) == 7
+
+    def test_parses_zero(self, test_credentials: Session) -> None:
+        """``Retry-After: 0`` means "retry immediately" and is preserved."""
+        client = MixpanelAPIClient(session=test_credentials)
+        response = httpx.Response(429, headers={"Retry-After": "0"})
+        assert client._parse_retry_after(response) == 0
+
+    def test_missing_header_returns_none(self, test_credentials: Session) -> None:
+        """An absent Retry-After header yields None."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._parse_retry_after(httpx.Response(429)) is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["abc", "5.5", "", "Wed, 21 Oct 2015 07:28:00 GMT", "1e3", "0x10", "nan"],
+    )
+    def test_unparseable_header_returns_none(
+        self, test_credentials: Session, raw: str
+    ) -> None:
+        """Non-integer header values are treated as absent.
+
+        Args:
+            test_credentials: Session fixture.
+            raw: A Retry-After value Python's ``int()`` cannot parse.
+        """
+        client = MixpanelAPIClient(session=test_credentials)
+        response = httpx.Response(429, headers={"Retry-After": raw})
+        assert client._parse_retry_after(response) is None
+
+    @pytest.mark.parametrize("raw", ["-1", "-3600"])
+    def test_negative_header_returns_none(
+        self, test_credentials: Session, raw: str
+    ) -> None:
+        """A negative Retry-After is invalid and must not reach ``time.sleep``.
+
+        ``time.sleep(-1)`` raises ValueError, so a hostile server could crash
+        the retry loop with a one-character header.
+
+        Args:
+            test_credentials: Session fixture.
+            raw: A negative Retry-After value.
+        """
+        client = MixpanelAPIClient(session=test_credentials)
+        response = httpx.Response(429, headers={"Retry-After": raw})
+        assert client._parse_retry_after(response) is None
+
+
+class TestRetryWaitSeconds:
+    """Test ``_retry_wait_seconds`` clamping and backoff fallback."""
+
+    def test_none_falls_back_to_backoff(self, test_credentials: Session) -> None:
+        """Without a header the exponential backoff value is used."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._retry_wait_seconds(None, 0) == pytest.approx(
+            client._calculate_backoff(0), rel=0.2
+        )
+
+    def test_honors_reasonable_header(self, test_credentials: Session) -> None:
+        """A header below the cap is honored verbatim."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._retry_wait_seconds(5, 3) == 5.0
+
+    def test_zero_header_is_honored(self, test_credentials: Session) -> None:
+        """``Retry-After: 0`` sleeps zero seconds rather than backing off."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._retry_wait_seconds(0, 5) == 0.0
+
+    @pytest.mark.parametrize("retry_after", [61, 3600, 86400, 2**40])
+    def test_huge_header_is_capped(
+        self, test_credentials: Session, retry_after: int
+    ) -> None:
+        """A huge Retry-After is capped at the backoff ceiling, not slept off.
+
+        Args:
+            test_credentials: Session fixture.
+            retry_after: An implausibly large Retry-After value.
+        """
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._retry_wait_seconds(retry_after, 0) == 60.0
+
+    def test_wait_never_exceeds_cap_for_late_attempts(
+        self, test_credentials: Session
+    ) -> None:
+        """The backoff fallback still honors its own ceiling plus jitter."""
+        client = MixpanelAPIClient(session=test_credentials)
+        assert client._retry_wait_seconds(None, 40) <= 66.0
+
+
+class TestRetryAfterHardening:
+    """End-to-end retry behavior with hostile Retry-After headers."""
+
+    @staticmethod
+    def _rate_limited_then_ok(
+        header: dict[str, str], payload: Any
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        """Build a handler that 429s once and then succeeds.
+
+        Args:
+            header: Response headers for the 429.
+            payload: JSON payload returned on the second call.
+
+        Returns:
+            An httpx.MockTransport handler.
+        """
+        state = {"calls": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return 429 on the first call, then the payload.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                The mocked response.
+            """
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return httpx.Response(429, headers=header)
+            return httpx.Response(200, json=payload)
+
+        return handler
+
+    def test_negative_retry_after_uses_backoff(
+        self,
+        test_credentials: Session,
+        recorded_sleeps: list[float],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A negative Retry-After must not be passed to ``time.sleep``.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+            monkeypatch: Used to pin the backoff to a known value.
+        """
+        transport = httpx.MockTransport(
+            self._rate_limited_then_ok({"Retry-After": "-5"}, ["event1"])
+        )
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+        monkeypatch.setattr(client, "_calculate_backoff", lambda _attempt: 0.125)
+
+        with client:
+            assert client.get_events() == ["event1"]
+
+        assert recorded_sleeps == [0.125]
+
+    def test_huge_retry_after_is_capped(
+        self, test_credentials: Session, recorded_sleeps: list[float]
+    ) -> None:
+        """A day-long Retry-After is clamped to the 60s backoff ceiling.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+        """
+        transport = httpx.MockTransport(
+            self._rate_limited_then_ok({"Retry-After": "86400"}, ["event1"])
+        )
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+
+        with client:
+            assert client.get_events() == ["event1"]
+
+        assert recorded_sleeps == [60.0]
+
+    def test_garbage_retry_after_uses_backoff(
+        self,
+        test_credentials: Session,
+        recorded_sleeps: list[float],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unparseable Retry-After falls back to exponential backoff.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+            monkeypatch: Used to pin the backoff to a known value.
+        """
+        transport = httpx.MockTransport(
+            self._rate_limited_then_ok({"Retry-After": "soon"}, ["event1"])
+        )
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+        monkeypatch.setattr(client, "_calculate_backoff", lambda _attempt: 0.25)
+
+        with client:
+            assert client.get_events() == ["event1"]
+
+        assert recorded_sleeps == [0.25]
+
+    def test_negative_retry_after_omitted_from_error(
+        self, test_credentials: Session, recorded_sleeps: list[float]
+    ) -> None:
+        """A negative header is not echoed as ``retry_after`` on the error.
+
+        ``RateLimitError``'s documented usage is ``time.sleep(e.retry_after or
+        60)``, which a negative value would break in caller code too.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations (unused, guards timing).
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Always rate limit with a negative Retry-After.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                A 429 response.
+            """
+            return httpx.Response(429, headers={"Retry-After": "-5"})
+
+        transport = httpx.MockTransport(handler)
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=0, _transport=transport
+        )
+
+        with client, pytest.raises(RateLimitError) as exc_info:
+            client.get_events()
+
+        assert exc_info.value.retry_after is None
+        assert "Retry after" not in str(exc_info.value)
+
+    def test_huge_retry_after_reported_verbatim_on_error(
+        self, test_credentials: Session
+    ) -> None:
+        """The cap applies to sleeping, not to what the server is reported to say."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Always rate limit with a large Retry-After.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                A 429 response.
+            """
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+
+        transport = httpx.MockTransport(handler)
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=0, _transport=transport
+        )
+
+        with client, pytest.raises(RateLimitError) as exc_info:
+            client.get_events()
+
+        assert exc_info.value.retry_after == 3600
+
+    def test_app_request_negative_retry_after_uses_backoff(
+        self,
+        test_credentials: Session,
+        recorded_sleeps: list[float],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """app_request's inline retry validates Retry-After too.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+            monkeypatch: Used to pin the backoff to a known value.
+        """
+        transport = httpx.MockTransport(
+            self._rate_limited_then_ok({"Retry-After": "-1"}, {"results": [1]})
+        )
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+        monkeypatch.setattr(client, "_calculate_backoff", lambda _attempt: 0.5)
+
+        with client:
+            assert client.app_request("GET", "/projects/12345/dashboards") == [1]
+
+        assert recorded_sleeps == [0.5]
+
+    def test_app_request_huge_retry_after_is_capped(
+        self, test_credentials: Session, recorded_sleeps: list[float]
+    ) -> None:
+        """app_request clamps an oversized Retry-After to the backoff ceiling.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+        """
+        transport = httpx.MockTransport(
+            self._rate_limited_then_ok({"Retry-After": "99999"}, {"results": [1]})
+        )
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+
+        with client:
+            assert client.app_request("GET", "/projects/12345/dashboards") == [1]
+
+        assert recorded_sleeps == [60.0]
+
+    def test_export_events_negative_retry_after_uses_backoff(
+        self,
+        test_credentials: Session,
+        recorded_sleeps: list[float],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The export stream retry validates Retry-After as well.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations.
+            monkeypatch: Used to pin the backoff to a known value.
+        """
+        calls = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Rate limit once with a negative Retry-After, then stream one event.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                The mocked response.
+            """
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "-30"})
+            return httpx.Response(
+                200, content=b'{"event":"A","properties":{"time":1}}\n'
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=2, _transport=transport
+        )
+        monkeypatch.setattr(client, "_calculate_backoff", lambda _attempt: 0.75)
+
+        with client:
+            events = list(client.export_events("2024-01-01", "2024-01-31"))
+
+        assert len(events) == 1
+        assert recorded_sleeps == [0.75]
+
+
+# =============================================================================
+# Error-message fallbacks for blank error bodies
+# =============================================================================
+
+
+class TestBlankErrorBodyFallbacks:
+    """A response with no usable error text must not produce a blank message."""
+
+    @staticmethod
+    def _client(credentials: Session, response: httpx.Response) -> MixpanelAPIClient:
+        """Build a client whose transport always returns ``response``.
+
+        Args:
+            credentials: Session fixture value.
+            response: The response to return for every request.
+
+        Returns:
+            A client wired to a single-response mock transport.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return the canned response.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                The canned response.
+            """
+            return response
+
+        return create_mock_client(credentials, handler)
+
+    def test_400_with_blank_text_body(self, test_credentials: Session) -> None:
+        """A 400 whose body is only whitespace falls back to a default message."""
+        with (
+            self._client(test_credentials, httpx.Response(400, text="   ")) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message.strip() == "Unknown error"
+
+    def test_400_with_blank_error_field(self, test_credentials: Session) -> None:
+        """A 400 body of ``{"error": ""}`` falls back to a default message."""
+        with (
+            self._client(
+                test_credentials, httpx.Response(400, json={"error": ""})
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == "Unknown error"
+
+    def test_403_with_blank_error_field(self, test_credentials: Session) -> None:
+        """A 403 body of ``{"error": ""}`` falls back to "Permission denied"."""
+        with (
+            self._client(
+                test_credentials, httpx.Response(403, json={"error": ""})
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == "Permission denied"
+
+    def test_404_with_blank_error_field(self, test_credentials: Session) -> None:
+        """A 404 body of ``{"error": ""}`` falls back to "Resource not found"."""
+        with (
+            self._client(
+                test_credentials, httpx.Response(404, json={"error": ""})
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == "Resource not found"
+
+    def test_generic_4xx_with_blank_error_field(
+        self, test_credentials: Session
+    ) -> None:
+        """A 412 body of ``{"error": ""}`` falls back to "Request failed"."""
+        with (
+            self._client(
+                test_credentials, httpx.Response(412, json={"error": ""})
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == "Request failed"
+
+    def test_400_with_structured_error_value(self, test_credentials: Session) -> None:
+        """A non-string ``error`` value is stringified, never leaked as a dict."""
+        with (
+            self._client(
+                test_credentials,
+                httpx.Response(400, json={"error": {"code": "BAD_SEGMENT"}}),
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert isinstance(exc_info.value.message, str)
+        assert "BAD_SEGMENT" in exc_info.value.message
+
+    def test_500_with_blank_error_field(self, test_credentials: Session) -> None:
+        """A 5xx body of ``{"error": ""}`` still names the status code."""
+        from mixpanel_headless.exceptions import ServerError
+
+        with (
+            self._client(
+                test_credentials, httpx.Response(500, json={"error": ""})
+            ) as client,
+            pytest.raises(ServerError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == "Server error: 500"
+
+    def test_400_message_preserved_when_present(
+        self, test_credentials: Session
+    ) -> None:
+        """A usable message is passed through untouched (no stripping)."""
+        with (
+            self._client(
+                test_credentials, httpx.Response(400, json={"error": " boom "})
+            ) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.get_events()
+
+        assert exc_info.value.message == " boom "
+
+
+# =============================================================================
+# Request-context symmetry across error branches
+# =============================================================================
+
+
+class TestErrorContextSymmetry:
+    """Every error branch should carry the same request context."""
+
+    def test_401_carries_request_body(self, test_credentials: Session) -> None:
+        """A 401 echoes the request body, like the 400/403/404 branches do."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return an unauthenticated response.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                A 401 response.
+            """
+            return httpx.Response(401, json={"error": "nope"})
+
+        with (
+            create_mock_client(test_credentials, handler) as client,
+            pytest.raises(AuthenticationError) as exc_info,
+        ):
+            client.request(
+                "POST",
+                "https://mixpanel.com/api/app/test",
+                json_body={"name": "dash"},
+            )
+
+        exc = exc_info.value
+        assert exc.request_body == {"name": "dash"}
+        assert exc.details["request_body"] == {"name": "dash"}
+        assert exc.request_params is not None
+
+    def test_app_request_422_carries_request_params(
+        self, test_credentials: Session
+    ) -> None:
+        """The 422 branch carries query params, like every other error branch."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return a validation failure.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                A 422 response.
+            """
+            return httpx.Response(422, json={"error": "bad field"})
+
+        with (
+            create_mock_client(test_credentials, handler) as client,
+            pytest.raises(QueryError) as exc_info,
+        ):
+            client.app_request(
+                "POST",
+                "/projects/12345/dashboards",
+                params={"workspace_id": "77"},
+                json_body={"title": "x"},
+            )
+
+        exc = exc_info.value
+        assert exc.request_params == {"workspace_id": "77"}
+        assert exc.request_body == {"title": "x"}
+
+    def test_app_request_rate_limit_carries_request_params(
+        self, test_credentials: Session, recorded_sleeps: list[float]
+    ) -> None:
+        """The app_request 429 exhaustion error carries query params.
+
+        Args:
+            test_credentials: Session fixture.
+            recorded_sleeps: Captured sleep durations (keeps the test fast).
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Always rate limit.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Returns:
+                A 429 response.
+            """
+            return httpx.Response(429)
+
+        transport = httpx.MockTransport(handler)
+        client = MixpanelAPIClient(
+            session=test_credentials, max_retries=0, _transport=transport
+        )
+
+        with client, pytest.raises(RateLimitError) as exc_info:
+            client.app_request(
+                "GET", "/projects/12345/dashboards", params={"workspace_id": "77"}
+            )
+
+        assert exc_info.value.request_params == {"workspace_id": "77"}
+        assert exc_info.value.project_id == "12345"
+
+    def test_app_request_http_error_details_carry_request_params(
+        self, test_credentials: Session
+    ) -> None:
+        """Transport failures report the params that were in flight."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Fail at the transport layer.
+
+            Args:
+                _request: The outgoing request (unused).
+
+            Raises:
+                httpx.ConnectError: Always.
+            """
+            raise httpx.ConnectError("connection refused")
+
+        with (
+            create_mock_client(test_credentials, handler) as client,
+            pytest.raises(MixpanelHeadlessError) as exc_info,
+        ):
+            client.app_request(
+                "GET", "/projects/12345/dashboards", params={"workspace_id": "77"}
+            )
+
+        assert exc_info.value.details["request_params"] == {"workspace_id": "77"}
+
+
+# =============================================================================
+# Coded guard errors — AC2–AC6 export_profiles guards (E2 pass, design §1.6)
+# =============================================================================
+
+
+class TestCodedExportProfilesCodes:
+    """Coded-guard tests for the export_profiles AC* sites (design §1.6).
+
+    Assertions are class + ``.code`` only — never message text (R5.4).
+    """
+
+    @staticmethod
+    def _client(credentials: Session) -> MixpanelAPIClient:
+        """Build a client whose transport returns an empty profile page.
+
+        Args:
+            credentials: Session to bind the client to.
+
+        Returns:
+            MixpanelAPIClient with a mock transport (never reached by
+            the guard tests — all guards fire pre-transport).
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return an empty engage results page."""
+            return httpx.Response(200, json={"results": []})
+
+        return create_mock_client(credentials, handler)
+
+    def test_ac2_single_ids_raise_coded_error(self, test_credentials: Session) -> None:
+        """distinct_id together with distinct_ids raises AC2."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(distinct_id="u1", distinct_ids=["u2"]))
+            assert excinfo.value.code == "AC2_DISTINCT_ID_CONFLICT"
+
+    def test_ac2_many_ids_raise_coded_error(self, test_credentials: Session) -> None:
+        """AC2 fires regardless of how many distinct_ids are supplied."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(
+                    client.export_profiles(
+                        distinct_id="u1", distinct_ids=["u2", "u3", "u4"]
+                    )
+                )
+            assert excinfo.value.code == "AC2_DISTINCT_ID_CONFLICT"
+
+    def test_ac3_behaviors_with_cohort_raise_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """behaviors together with cohort_id raises AC3."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(
+                    client.export_profiles(
+                        behaviors=[{"event": "Purchase"}], cohort_id="c1"
+                    )
+                )
+            assert excinfo.value.code == "AC3_BEHAVIORS_COHORT_CONFLICT"
+
+    def test_ac3_empty_behaviors_with_cohort_raise_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """An empty behaviors list still conflicts with cohort_id (AC3)."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(behaviors=[], cohort_id="c1"))
+            assert excinfo.value.code == "AC3_BEHAVIORS_COHORT_CONFLICT"
+
+    def test_ac4_include_all_users_alone_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """include_all_users without cohort_id raises AC4."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(include_all_users=True))
+            assert excinfo.value.code == "AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT"
+
+    def test_ac4_include_all_users_with_where_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """AC4 fires even when other engage params are present."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(
+                    client.export_profiles(
+                        include_all_users=True,
+                        where='properties["plan"] == "premium"',
+                    )
+                )
+            assert excinfo.value.code == "AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT"
+
+    def test_ac5_behaviors_string_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """A string behaviors value raises AC5."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(behaviors="not-a-list"))  # type: ignore[arg-type]
+            assert excinfo.value.code == "AC5_BEHAVIORS_NOT_LIST"
+
+    def test_ac5_behaviors_dict_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """A bare dict behaviors value raises AC5."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(behaviors={"event": "P"}))  # type: ignore[arg-type]
+            assert excinfo.value.code == "AC5_BEHAVIORS_NOT_LIST"
+
+    def test_ac6_near_future_timestamp_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """An as_of_timestamp slightly in the future raises AC6."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(client.export_profiles(as_of_timestamp=int(time.time()) + 10_000))
+            assert excinfo.value.code == "AC6_AS_OF_TIMESTAMP_FUTURE"
+
+    def test_ac6_far_future_timestamp_raises_coded_error(
+        self, test_credentials: Session
+    ) -> None:
+        """An as_of_timestamp far in the future raises AC6."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ParamValidationError) as excinfo:
+                list(
+                    client.export_profiles(
+                        as_of_timestamp=int(time.time()) + 10_000_000
+                    )
+                )
+            assert excinfo.value.code == "AC6_AS_OF_TIMESTAMP_FUTURE"
+
+    def test_ac_guards_stay_catchable_as_value_error(
+        self, test_credentials: Session
+    ) -> None:
+        """Converted AC* guards remain catchable via bare ValueError."""
+        with self._client(test_credentials) as client:
+            with pytest.raises(ValueError) as excinfo:
+                list(client.export_profiles(include_all_users=True))
+            assert isinstance(excinfo.value, ParamValidationError)
+            assert excinfo.value.code == "AC4_INCLUDE_ALL_USERS_REQUIRES_COHORT"

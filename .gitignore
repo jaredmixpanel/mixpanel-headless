@@ -41,6 +41,8 @@ node_modules/
 
 # Testing
 .pytest_cache/
+mutants/
+.mutmut-cache
 .coverage
 coverage.xml
 htmlcov/
